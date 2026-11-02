@@ -115,7 +115,14 @@
         <input id="gain" type="range" min="0.2" max="8" step="0.1" data-setting="gain">
       </div>
       <div class="field">
-        <span class="label">Low-pass</span>
+        <span class="label">Trace</span>
+        <div class="seg" data-setting="trace">
+          <button data-value="lines">Lines (analog)</button>
+          <button data-value="points">Points</button>
+        </div>
+      </div>
+      <div class="field">
+        <span class="label">Low-pass (LPF)</span>
         <div class="seg" data-setting="lowpass">
           <button data-value="off">Off</button>
           <button data-value="low">Low</button>
@@ -216,8 +223,8 @@
       <div class="field">
         <span class="label">Save as</span>
         <div class="seg" data-setting="fileFormat">
-          <button data-value="jpeg">JPEG</button>
-          <button data-value="png">PNG</button>
+          <button data-value="png">PNG (sharp)</button>
+          <button data-value="jpeg">JPEG (smaller)</button>
         </div>
       </div>
       <p class="hint">Save renders at full quality. With a video or the live camera, Record makes a new video with the scope composed in.</p>
