@@ -1,0 +1,41 @@
+# Projector Waveform
+
+A phone app (installable web app / PWA) that puts a DaVinci Resolve-style **waveform monitor** on photos and videos of a projected image. You calibrate it to your projector's **peak white**, so you can see how much of the projector's dynamic range a picture is actually using.
+
+It runs on iPhone and Android with no app store. Open the page and choose *Add to Home Screen*.
+
+## What it does
+
+- **Open** a photo or video from the gallery (or take one: the phone's picker offers the camera), or use **Live** for the camera feed.
+- **Scopes:** Luma (Y′, Rec.709), RGB Parade, RGB Overlay.
+- **Scales:** 10-bit code values (0–1023, like Resolve), percent, or **stops** below peak white (light, log scale).
+- **Calibrate:** *Set white* on a shot of a 100% white frame. *Set black* on a 0% black frame (optional). After that, 1023 / 100% is the projector's peak white, and the stops scale shows the measured black floor as a dashed blue line. The app also reports the projector's contrast as the camera saw it. Calibration is saved on the phone.
+- **Crop** to the projected picture so the scope's columns line up with the image. Turn on "keep crop" if you shoot from a tripod.
+- **Output:** save a new JPEG/PNG as **top/bottom**, **side-by-side**, **overlay** (scope over the lower part of the image) or **scope only**, with optional burned-in stats. For videos and the live camera, **Record** makes a new video with the scope composed in.
+- **Stats:** peak / floor / mean signal level, stops of light used, camera clipping, and the amount of the picture above reference white.
+- `patterns.html` provides white, black, step, ramp, checkerboard and window test patterns to show on the projector.
+
+## Getting accurate results
+
+The scope measures what the camera recorded, so the photos matter:
+
+1. **Lock the exposure** (iPhone: long-press to set AE/AF Lock. Android: Pro/Manual mode). Shoot the white frame and your content at the **same exposure**, and keep it there for the whole session.
+2. Expose so the white frame is **not clipped**: it should be bright but under 255. The app warns you when the white sample is clipped.
+3. Turn off HDR, Smart HDR and Night mode for photos, and turn off **HDR video** (iPhone: Settings → Camera → Record Video → HDR Video) for videos.
+4. Set *Projector gamma* to match the projector (2.2 or 2.4 are typical). The signal estimate inverts `L = black + (white − black) · signal^γ`.
+5. Phone cameras apply their own tone curve, so treat the readings as a good estimate rather than lab measurements. The *Stops* scale is the most robust view of "how much of the range is used".
+
+Without calibration, the scope shows the photo's own code values, the same as running Resolve on the JPEG.
+
+## Running / hosting
+
+The app is static files with no build step. The live camera and *Add to Home Screen* need **HTTPS**:
+
+- The included GitHub Actions workflow (`.github/workflows/waveform-app-pages.yml`) publishes this folder to GitHub Pages. In repository Settings → Pages, set *Source* to **GitHub Actions**.
+- Local testing: `cd waveform-app && python3 -m http.server 8000`, then open `http://localhost:8000`.
+
+## Code
+
+- `js/waveform.js` — transfer functions, calibration LUTs, waveform accumulation (with sub-code dithering so 8-bit sources don't band), statistics and scope rendering. Has no DOM dependencies, so it can be unit tested.
+- `js/app.js` — UI, gallery/video/camera sources, region picking, compositing, saving and recording.
+- `tests/` — `node --test waveform-app/tests/waveform.test.mjs`
