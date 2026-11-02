@@ -1,3 +1,4 @@
+import { FULL_QUAD, rectToQuad, isAxisAligned, quadBounds, quadAspect, warpQuad, detectPicture } from './geometry.js';
 import { buildLUTs, computeWaveform, drawScope, statsLines, formatStats, measureRegion, axisFor, fmtNits, LUMA, TRANSFERS } from './waveform.js';
 
 // ---------------------------------------------------------------------------
@@ -21,17 +22,35 @@ const store = {
 const DEFAULTS = {
   mode: 'overlay', format: 'sdr', scale: 'percent', sdrPeak: 100, hdrPeak: 1000, stopsRange: 12, gain: 1.5,
   cameraTF: 'srgb', displayTF: 'g24', perChannel: true,
-  layout: 'stacked', burnStats: true, fileFormat: 'jpeg', keepCrop: false,
+  layout: 'stacked', burnStats: true, fileFormat: 'jpeg', cropOnLoad: 'detect', aspect: 'auto',
 };
 const settings = { ...DEFAULTS, ...store.get('settings', {}) };
 if (settings.format !== 'sdr' && settings.format !== 'hdr') settings.format = 'sdr'; // older versions stored the file type here
 let calibration = store.get('calibration', { white: null, black: null });
-let crop = settings.keepCrop ? store.get('crop', null) : null; // normalized {x,y,w,h}
+if (settings.keepCrop !== undefined) { // migrate from v1
+  if (settings.keepCrop) settings.cropOnLoad = 'keep';
+  delete settings.keepCrop;
+}
+// Picture area: normalized quad [TL, TR, BR, BL] in photo coordinates, or null = whole photo.
+let crop = settings.cropOnLoad === 'full' ? null : migrateCrop(store.get('crop', null));
+function migrateCrop(c) {
+  if (!c) return null;
+  if (Array.isArray(c) && c.length === 4) return c;
+  if (typeof c.x === 'number') return rectToQuad(c);
+  return null;
+}
+function setCrop(q) {
+  crop = q;
+  store.set('crop', q);
+  pictureCache.key = '';
+}
 let luts = rebuildLUTs();
 
 let source = null; // {kind: 'image'|'video'|'camera', el, w, h, name}
 let stream = null;
-let pick = null; // {kind, bitmap, w, h, rect, drag}
+let pick = null; // {kind, bitmap, w, h, rect | quad, drag, corner}
+const pictureCache = { key: '', canvas: null };
+let sourceId = 0;
 let recorder = null;
 let looping = false;
 let renderQueued = false;
@@ -55,43 +74,80 @@ const workCtx = work.getContext('2d', { willReadFrequently: true });
 
 const even = (v) => Math.max(2, Math.round(v / 2) * 2);
 
+// The scope is always as tall as the picture.
 function layoutDims(W, aspect) {
   W = even(W);
   const ih = even(W * aspect);
   switch (settings.layout) {
     case 'side':
       return { cw: W * 2, ch: ih, img: { x: 0, y: 0, w: W, h: ih }, scope: { x: W, y: 0, w: W, h: ih } };
-    case 'overlay': {
-      const sh = even(ih * 0.42);
-      return { cw: W, ch: ih, img: { x: 0, y: 0, w: W, h: ih }, scope: { x: 0, y: ih - sh, w: W, h: sh }, overlay: true };
-    }
-    case 'scope': {
-      const sh = even(W * 0.5);
-      return { cw: W, ch: sh, img: null, scope: { x: 0, y: 0, w: W, h: sh } };
-    }
-    default: {
-      const sh = even(W * 0.5);
-      return { cw: W, ch: ih + sh, img: { x: 0, y: 0, w: W, h: ih }, scope: { x: 0, y: ih, w: W, h: sh } };
-    }
+    case 'overlay':
+      return { cw: W, ch: ih, img: { x: 0, y: 0, w: W, h: ih }, scope: { x: 0, y: 0, w: W, h: ih }, overlay: true };
+    case 'scope':
+      return { cw: W, ch: ih, img: null, scope: { x: 0, y: 0, w: W, h: ih } };
+    default:
+      return { cw: W, ch: ih * 2, img: { x: 0, y: 0, w: W, h: ih }, scope: { x: 0, y: ih, w: W, h: ih } };
   }
 }
 
-function cropRect(frameW, frameH) {
-  const c = crop || { x: 0, y: 0, w: 1, h: 1 };
-  return { sx: c.x * frameW, sy: c.y * frameH, sw: Math.max(1, c.w * frameW), sh: Math.max(1, c.h * frameH) };
+const ASPECTS = { '16:9': 16 / 9, '1.85': 1.85, '2.39': 2.39, '4:3': 4 / 3, '3:2': 1.5 };
+
+/** Picture geometry in source pixels: quad, natural size and the output aspect (h / w). */
+function pictureGeom(frameW, frameH) {
+  const q = (crop || FULL_QUAD).map(([x, y]) => [x * frameW, y * frameH]);
+  const warp = !!crop && !isAxisAligned(crop);
+  const b = quadBounds(q);
+  const natW = warp ? (Math.hypot(q[1][0] - q[0][0], q[1][1] - q[0][1]) + Math.hypot(q[2][0] - q[3][0], q[2][1] - q[3][1])) / 2 : b.w;
+  const wOverH = ASPECTS[settings.aspect] || (warp ? quadAspect(q) : b.w / b.h);
+  return { q, warp, bounds: b, natW: Math.max(1, natW), aspect: 1 / wOverH };
+}
+
+/**
+ * The picture as something drawImage() can take, plus the source rect to use.
+ * Perspective crops are rectified into a canvas of width `outW` (cached for stills).
+ */
+function getPicture(frame, frameW, frameH, outW) {
+  const g = pictureGeom(frameW, frameH);
+  if (!g.warp) return { el: frame, sx: g.bounds.x, sy: g.bounds.y, sw: g.bounds.w, sh: g.bounds.h, aspect: g.aspect, natW: g.natW };
+  const dw = Math.max(16, Math.round(Math.min(outW, g.natW * 1.25)));
+  const dh = Math.max(16, Math.round(dw * g.aspect));
+  const still = source && source.kind === 'image' && frame === source.el;
+  const key = still ? `${sourceId}|${JSON.stringify(crop)}|${dw}x${dh}` : '';
+  if (still && pictureCache.key === key) return { el: pictureCache.canvas, sx: 0, sy: 0, sw: dw, sh: dh, aspect: g.aspect, natW: g.natW };
+
+  // Read the quad's bounding box at about the output resolution, then warp it.
+  const b = g.bounds;
+  const s = Math.min(1, (1.3 * dw) / Math.max(1, b.w));
+  const tw = Math.max(2, Math.round(b.w * s)), th = Math.max(2, Math.round(b.h * s));
+  const tmp = document.createElement('canvas');
+  tmp.width = tw; tmp.height = th;
+  const tctx = tmp.getContext('2d', { willReadFrequently: true });
+  tctx.imageSmoothingQuality = 'high';
+  tctx.drawImage(frame, b.x, b.y, b.w, b.h, 0, 0, tw, th);
+  const src = tctx.getImageData(0, 0, tw, th).data;
+  const qt = g.q.map(([x, y]) => [((x - b.x) * tw) / b.w, ((y - b.y) * th) / b.h]);
+  const out = (still ? null : pictureCache.live) || document.createElement('canvas');
+  if (out.width !== dw) out.width = dw;
+  if (out.height !== dh) out.height = dh;
+  const octx = out.getContext('2d');
+  const img = octx.createImageData(dw, dh);
+  warpQuad(src, tw, th, qt, img.data, dw, dh);
+  octx.putImageData(img, 0, 0);
+  if (still) { pictureCache.key = key; pictureCache.canvas = out; } else pictureCache.live = out;
+  return { el: out, sx: 0, sy: 0, sw: dw, sh: dh, aspect: g.aspect, natW: g.natW };
 }
 
 /** Render the composite of `frame` into `canvas` with image width W. Returns stats. */
 function renderComposite(canvas, frame, frameW, frameH, W, analysisMax) {
-  const { sx, sy, sw, sh } = cropRect(frameW, frameH);
-  const aspect = sh / sw;
+  const pic = getPicture(frame, frameW, frameH, Math.max(W, analysisMax));
+  const aspect = pic.aspect;
   const d = layoutDims(W, aspect);
   if (canvas.width !== d.cw) canvas.width = d.cw;
   if (canvas.height !== d.ch) canvas.height = d.ch;
   const ctx = canvas.getContext('2d');
 
-  // Analysis pass on a down-scaled copy of the cropped frame.
-  let aw = Math.min(sw, analysisMax);
+  // Analysis pass on a down-scaled copy of the picture.
+  let aw = Math.min(pic.natW, analysisMax);
   let ah = aw * aspect;
   if (ah > analysisMax) { ah = analysisMax; aw = ah / aspect; }
   aw = Math.max(8, Math.round(aw));
@@ -99,7 +155,7 @@ function renderComposite(canvas, frame, frameW, frameH, W, analysisMax) {
   if (work.width !== aw) work.width = aw;
   if (work.height !== ah) work.height = ah;
   workCtx.imageSmoothingQuality = 'medium';
-  workCtx.drawImage(frame, sx, sy, sw, sh, 0, 0, aw, ah);
+  workCtx.drawImage(pic.el, pic.sx, pic.sy, pic.sw, pic.sh, 0, 0, aw, ah);
   const data = workCtx.getImageData(0, 0, aw, ah).data;
 
   const panelW = settings.mode === 'parade' ? d.scope.w / 3 : d.scope.w;
@@ -117,11 +173,11 @@ function renderComposite(canvas, frame, frameW, frameH, W, analysisMax) {
   if (d.img) {
     ctx.imageSmoothingEnabled = true;
     ctx.imageSmoothingQuality = 'high';
-    ctx.drawImage(frame, sx, sy, sw, sh, d.img.x, d.img.y, d.img.w, d.img.h);
+    ctx.drawImage(pic.el, pic.sx, pic.sy, pic.sw, pic.sh, d.img.x, d.img.y, d.img.w, d.img.h);
   }
   drawScope(ctx, wf, d.scope.x, d.scope.y, d.scope.w, d.scope.h, {
     gain: Number(settings.gain),
-    background: d.overlay ? 'rgba(0,0,0,0.55)' : '#0b0d0e',
+    background: d.overlay ? 'rgba(0,0,0,0.42)' : '#0b0d0e',
     blackLight: luts.blackLight,
     unit: settings.scale,
     format: settings.format,
@@ -157,8 +213,7 @@ function render() {
   renderQueued = false;
   if (pick) return renderPick();
   if (!source || !source.w) return;
-  const { sw, sh } = cropRect(source.w, source.h);
-  const aspect = sh / sw;
+  const aspect = pictureGeom(source.w, source.h).aspect;
   const W = previewW(aspect);
   if (recorder) {
     const d = layoutDims(W, aspect);
@@ -202,9 +257,10 @@ function showStats(s) {
   const parts = [
     `<b>Peak</b> ${f.peak}`,
     `<b>Floor</b> ${f.floor}`,
-    `<b>Mean</b> ${f.mean}`,
-    `<b>Range</b> ${s.rangeStops.toFixed(1)} stops`,
   ];
+  if (f.apl) parts.push(`<b title="Average picture level: mean signal">APL</b> ${f.apl}`);
+  parts.push(`<b title="Average display level: mean light on screen, relative to peak white">ADL</b> ${f.adl}`);
+  parts.push(`<b>Range</b> ${s.rangeStops.toFixed(1)} stops`);
   if (luts.calibrated) parts.push(`<b>Peak</b> ${s.peakStops.toFixed(1)} st from white`);
   else parts.push('<span class="warn">not calibrated</span>');
   if (s.clipped > 0.002) parts.push(`<span class="warn">camera clipped ${(s.clipped * 100).toFixed(1)}%</span>`);
@@ -267,19 +323,55 @@ function rebuildLUTs() {
 function setSource(src) {
   if (source && source.kind === 'image' && source.url) URL.revokeObjectURL(source.url);
   source = src;
-  if (!settings.keepCrop) crop = null;
+  sourceId++;
+  pictureCache.key = '';
+  if (settings.cropOnLoad === 'full') setCrop(null);
   $('empty').hidden = !!src;
   $('saveBtn').disabled = !src;
   $('setWhite').disabled = !src;
   $('setBlack').disabled = !src;
   $('setCrop').disabled = !src;
+  $('detectCrop').disabled = !src;
   const moving = src && (src.kind === 'video' || src.kind === 'camera');
   $('recordBtn').hidden = !moving || typeof MediaRecorder === 'undefined';
   $('videoBar').hidden = !src || src.kind !== 'video';
   $('camControls').hidden = !src || src.kind !== 'camera';
   $('cameraBtn').classList.toggle('primary', !!src && src.kind === 'camera');
+  if (src && src.kind === 'image' && settings.cropOnLoad === 'detect') autoDetect(src.el, src.w, src.h, true);
   if (moving) startLoop();
   else requestRender();
+}
+
+// ---------------------------------------------------------------------------
+// Picture-area detection
+// ---------------------------------------------------------------------------
+
+/** Run edge detection on a frame. Returns the detection result (normalized quads) or null. */
+function detectOn(frame, fw, fh, useRaster = true) {
+  const w = 512, h = Math.max(16, Math.round((512 * fh) / fw));
+  const c = document.createElement('canvas');
+  c.width = w; c.height = h;
+  const cx = c.getContext('2d', { willReadFrequently: true });
+  cx.imageSmoothingQuality = 'medium';
+  cx.drawImage(frame, 0, 0, fw, fh, 0, 0, w, h);
+  const raster = useRaster && calibration.raster && calibration.rasterSize === `${fw}x${fh}` ? calibration.raster : null;
+  return detectPicture(cx.getImageData(0, 0, w, h).data, w, h, raster ? { raster } : {});
+}
+
+/** Detect the picture on a frame and use it, keeping the previous area if detection is unsure. */
+function autoDetect(frame, fw, fh, quiet = false) {
+  let r = null;
+  try { r = detectOn(frame, fw, fh); } catch (err) { console.error(err); }
+  if (r && r.ok) {
+    setCrop(r.quad);
+    if (!quiet) toast(r.trimmed ? 'Picture found (black bars excluded)' : 'Picture edges found');
+    return true;
+  }
+  if (!quiet || !crop) {
+    toast(crop ? 'Couldn’t find the picture edges clearly; kept the previous area.'
+      : 'Couldn’t find the picture edges. Use Crop → Adjust, or detect on the white frame.', 5000);
+  }
+  return false;
 }
 
 function stopVideo() {
@@ -343,6 +435,9 @@ function loadVideo(file) {
     video.onloadedmetadata = () => {
       video.onloadedmetadata = null;
       setSource({ kind: 'video', el: video, w: video.videoWidth, h: video.videoHeight, name: baseName(file.name) });
+      if (settings.cropOnLoad === 'detect') {
+        video.addEventListener('seeked', () => { autoDetect(video, video.videoWidth, video.videoHeight, true); requestRender(); }, { once: true });
+      }
       video.currentTime = Math.min(0.05, video.duration || 0);
       updatePlayUI();
       resolve();
@@ -442,54 +537,113 @@ async function startPick(kind) {
     bitmap = c;
   }
   looping = false;
-  let rect;
-  if (kind === 'crop') rect = crop ? { ...crop } : null;
-  else {
-    const c = crop || { x: 0, y: 0, w: 1, h: 1 };
-    rect = { x: c.x + c.w * 0.3, y: c.y + c.h * 0.3, w: c.w * 0.4, h: c.h * 0.4 };
+  pick = { kind, bitmap, w, h, rect: null, quad: null, drag: null, corner: -1 };
+  if (kind === 'crop') {
+    pick.quad = crop ? crop.map((p) => [...p]) : null;
+  } else {
+    // Default sample: the middle of the picture area.
+    const b = quadBounds(crop || FULL_QUAD);
+    pick.rect = { x: b.x + b.w * 0.3, y: b.y + b.h * 0.3, w: b.w * 0.4, h: b.h * 0.4 };
   }
-  pick = { kind, bitmap, w, h, rect, drag: null };
   stage.classList.add('picking');
   stage.style.touchAction = 'none';
+  // Bring the whole photo into view below the sticky header.
+  const top = stage.getBoundingClientRect().top + window.scrollY - document.querySelector('.topbar').offsetHeight - 8;
+  window.scrollTo({ top: Math.max(0, top), behavior: 'smooth' });
   $('pickBar').hidden = false;
+  $('pickAuto').hidden = kind !== 'crop';
   $('pickHint').textContent = {
     white: 'Drag a box over the 100% white screen',
     black: 'Drag a box over the 0% black screen',
-    crop: 'Drag a box around the projected picture',
+    crop: 'Drag the corners onto the picture edges',
   }[kind];
-  $('pickOk').disabled = !rect;
+  updatePickOk();
   render();
 }
 
-function renderPick() {
-  const { bitmap, w, h, rect, kind } = pick;
-  const ratio = h / w;
+function updatePickOk() {
+  const ok = pick.kind === 'crop' ? !!pick.quad : !!pick.rect;
+  $('pickOk').disabled = !ok;
+}
+
+function pickCanvasSize() {
+  const ratio = pick.h / pick.w;
   const cssW = fitCanvasCSS(ratio);
   const dpr = Math.min(window.devicePixelRatio || 1, 2.5);
   const cw = Math.round(Math.min(cssW * dpr, 2000));
-  const ch = Math.round(cw * ratio);
+  return { cw, ch: Math.round(cw * ratio), scale: cw / cssW };
+}
+
+function tracePoly(ctx, q, cw, ch) {
+  ctx.moveTo(q[0][0] * cw, q[0][1] * ch);
+  for (let i = 1; i < 4; i++) ctx.lineTo(q[i][0] * cw, q[i][1] * ch);
+  ctx.closePath();
+}
+
+function renderPick() {
+  const { bitmap, w, h, rect, quad, kind } = pick;
+  const { cw, ch, scale } = pickCanvasSize();
   view.width = cw;
   view.height = ch;
   const ctx = view.getContext('2d');
   ctx.drawImage(bitmap, 0, 0, w, h, 0, 0, cw, ch);
-  const lw = Math.max(2, cw / 400);
+  const lw = Math.max(2, 1.5 * scale);
+  const color = kind === 'black' ? '#7fb0ff' : '#e0b65a';
   if (crop && kind !== 'crop') {
     ctx.setLineDash([lw * 4, lw * 3]);
     ctx.strokeStyle = 'rgba(255,255,255,0.6)';
     ctx.lineWidth = lw;
-    ctx.strokeRect(crop.x * cw, crop.y * ch, crop.w * cw, crop.h * ch);
+    ctx.beginPath(); tracePoly(ctx, crop, cw, ch); ctx.stroke();
     ctx.setLineDash([]);
   }
-  if (rect) {
-    const x = rect.x * cw, y = rect.y * ch, rw = rect.w * cw, rh = rect.h * ch;
-    ctx.fillStyle = 'rgba(0,0,0,0.5)';
+  const area = kind === 'crop' ? quad : rect && rectToQuad(rect);
+  if (!area) return;
+  ctx.fillStyle = 'rgba(0,0,0,0.5)';
+  ctx.beginPath();
+  ctx.rect(0, 0, cw, ch);
+  tracePoly(ctx, area, cw, ch);
+  ctx.fill('evenodd');
+  ctx.strokeStyle = color;
+  ctx.lineWidth = lw;
+  ctx.beginPath(); tracePoly(ctx, area, cw, ch); ctx.stroke();
+  if (kind !== 'crop') return;
+
+  // Corner handles
+  const r = 11 * scale;
+  quad.forEach(([x, y], i) => {
     ctx.beginPath();
-    ctx.rect(0, 0, cw, ch);
-    ctx.rect(x, y, rw, rh);
-    ctx.fill('evenodd');
-    ctx.strokeStyle = kind === 'black' ? '#7fb0ff' : '#e0b65a';
+    ctx.arc(x * cw, y * ch, r, 0, Math.PI * 2);
+    ctx.fillStyle = i === pick.corner ? 'rgba(224,182,90,0.55)' : 'rgba(224,182,90,0.25)';
+    ctx.fill();
+    ctx.stroke();
+  });
+  // Loupe while dragging a corner: magnified view in the opposite top corner.
+  if (pick.corner >= 0) {
+    const [x, y] = quad[pick.corner];
+    const L = Math.round(Math.min(cw, ch) * 0.36), zoom = 5;
+    const lx = x < 0.5 ? cw - L - 8 * scale : 8 * scale, ly = 8 * scale;
+    const sw = (L / zoom) * (w / cw), sh = (L / zoom) * (h / ch);
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(lx, ly, L, L);
+    ctx.clip();
+    ctx.imageSmoothingEnabled = false;
+    ctx.drawImage(bitmap, x * w - sw / 2, y * h - sh / 2, sw, sh, lx, ly, L, L);
+    // edges of the quad inside the loupe
+    ctx.translate(lx + L / 2, ly + L / 2);
+    ctx.scale(zoom, zoom);
+    ctx.translate(-x * cw, -y * ch);
+    ctx.strokeStyle = color;
+    ctx.lineWidth = lw / zoom;
+    ctx.beginPath(); tracePoly(ctx, quad, cw, ch); ctx.stroke();
+    ctx.restore();
+    ctx.strokeStyle = '#fff';
     ctx.lineWidth = lw;
-    ctx.strokeRect(x, y, rw, rh);
+    ctx.strokeRect(lx, ly, L, L);
+    ctx.beginPath();
+    ctx.moveTo(lx + L / 2, ly + L / 2 - 10 * scale); ctx.lineTo(lx + L / 2, ly + L / 2 + 10 * scale);
+    ctx.moveTo(lx + L / 2 - 10 * scale, ly + L / 2); ctx.lineTo(lx + L / 2 + 10 * scale, ly + L / 2);
+    ctx.stroke();
   }
 }
 
@@ -498,6 +652,7 @@ function toNorm(e) {
   return {
     x: Math.min(1, Math.max(0, (e.clientX - r.left) / r.width)),
     y: Math.min(1, Math.max(0, (e.clientY - r.top) / r.height)),
+    r,
   };
 }
 
@@ -506,26 +661,71 @@ view.addEventListener('pointerdown', (e) => {
   e.preventDefault();
   view.setPointerCapture(e.pointerId);
   const p = toNorm(e);
+  pick.corner = -1;
+  if (pick.kind === 'crop' && pick.quad) {
+    // Grab the nearest corner if the finger is close to one.
+    let best = -1, bd = 36;
+    pick.quad.forEach(([x, y], i) => {
+      const d = Math.hypot((x - p.x) * p.r.width, (y - p.y) * p.r.height);
+      if (d < bd) { bd = d; best = i; }
+    });
+    if (best >= 0) {
+      pick.corner = best;
+      pick.grab = [pick.quad[best][0] - p.x, pick.quad[best][1] - p.y];
+      render();
+      return;
+    }
+  }
   pick.drag = p;
-  pick.rect = { x: p.x, y: p.y, w: 0, h: 0 };
+  if (pick.kind === 'crop') pick.quad = null;
+  else pick.rect = null;
   render();
 });
 view.addEventListener('pointermove', (e) => {
-  if (!pick || !pick.drag) return;
-  const p = toNorm(e), a = pick.drag;
-  pick.rect = { x: Math.min(a.x, p.x), y: Math.min(a.y, p.y), w: Math.abs(p.x - a.x), h: Math.abs(p.y - a.y) };
+  if (!pick) return;
+  const p = toNorm(e);
+  if (pick.corner >= 0) {
+    pick.quad[pick.corner] = [Math.min(1, Math.max(0, p.x + pick.grab[0])), Math.min(1, Math.max(0, p.y + pick.grab[1]))];
+    render();
+    return;
+  }
+  if (!pick.drag) return;
+  const a = pick.drag;
+  const r = { x: Math.min(a.x, p.x), y: Math.min(a.y, p.y), w: Math.abs(p.x - a.x), h: Math.abs(p.y - a.y) };
+  if (pick.kind === 'crop') pick.quad = rectToQuad(r);
+  else pick.rect = r;
   render();
 });
 const endDrag = () => {
-  if (!pick || !pick.drag) return;
-  pick.drag = null;
-  const ok = pick.rect && pick.rect.w > 0.005 && pick.rect.h > 0.005;
-  if (!ok) pick.rect = null;
-  $('pickOk').disabled = !ok;
+  if (!pick) return;
+  if (pick.corner >= 0) {
+    pick.corner = -1;
+  } else if (pick.drag) {
+    pick.drag = null;
+    const b = pick.kind === 'crop' ? (pick.quad && quadBounds(pick.quad)) : pick.rect;
+    if (!b || b.w < 0.01 || b.h < 0.01) {
+      if (pick.kind === 'crop') pick.quad = null; else pick.rect = null;
+    }
+  }
+  updatePickOk();
   render();
 };
 view.addEventListener('pointerup', endDrag);
 view.addEventListener('pointercancel', endDrag);
+
+function pickAuto() {
+  if (!pick || pick.kind !== 'crop') return;
+  const r = detectOn(pick.bitmap, pick.w, pick.h);
+  if (r) {
+    pick.quad = r.quad;
+    toast(r.ok ? (r.trimmed ? 'Picture found (black bars excluded). Adjust the corners if needed.' : 'Picture edges found. Adjust the corners if needed.')
+      : 'Not sure about these edges. Please check the corners.', 4000);
+  } else {
+    toast('Couldn’t find the picture. Drag a box around it instead.');
+  }
+  updatePickOk();
+  render();
+}
 
 function cancelPick() {
   if (!pick) return;
@@ -538,12 +738,21 @@ function cancelPick() {
 }
 
 function confirmPick() {
-  if (!pick || !pick.rect) return;
+  if (!pick) return;
   const { kind, rect, bitmap, w, h } = pick;
   if (kind === 'crop') {
-    crop = rect;
-    if (settings.keepCrop) store.set('crop', crop);
+    if (!pick.quad) return;
+    setCrop(pick.quad);
   } else {
+    if (!rect) return;
+    calibrateFrom(kind, bitmap, w, h, rect);
+  }
+  cancelPick();
+}
+
+/** Measure a white/black reference from `rect` (normalized) of a frame and store it. */
+function calibrateFrom(kind, bitmap, w, h, rect, quiet = false) {
+  {
     const sx = rect.x * w, sy = rect.y * h, sw = Math.max(1, rect.w * w), sh = Math.max(1, rect.h * h);
     const s = Math.min(1, 600 / Math.max(sw, sh));
     const c = document.createElement('canvas');
@@ -554,18 +763,53 @@ function confirmPick() {
     const m = measureRegion(cx.getImageData(0, 0, c.width, c.height).data);
     m.date = new Date().toISOString();
     calibration[kind] = m;
+    let found = '';
+    if (kind === 'white') {
+      // A white frame is the most reliable view of the projector raster: remember it.
+      const r = detectOn(bitmap, w, h, false);
+      if (r && r.ok) {
+        calibration.raster = r.raster;
+        calibration.rasterSize = `${w}x${h}`;
+        if (settings.cropOnLoad !== 'full') setCrop(r.quad);
+        found = ' Picture edges found and remembered.';
+      }
+    }
     store.set('calibration', calibration);
     luts = rebuildLUTs();
     showCalibration();
     if (kind === 'white' && m.clipped > 0.02) {
       toast(`${Math.round(m.clipped * 100)}% of the white area is clipped by the camera. Lower the exposure and shoot it again for an accurate reference.`, 8000);
     } else if (kind === 'white' && Math.max(...m.codeMean) < 60) {
-      toast('That white looks very dark — is the exposure too low?');
-    } else {
-      toast(kind === 'white' ? 'Reference white set: 100% = projector peak white' : 'Reference black set');
+      toast('That white looks very dark. Is the exposure too low?');
+    } else if (!quiet) {
+      toast(kind === 'white' ? 'Reference white set: 100% = projector peak white.' + found : 'Reference black set');
     }
   }
-  cancelPick();
+}
+
+// ---------------------------------------------------------------------------
+// Sample photos (simulated phone shots of a projector, see samples/generate.py)
+// ---------------------------------------------------------------------------
+
+async function openSample(name) {
+  const res = await fetch(`samples/${name}.jpg`);
+  if (!res.ok) throw new Error('missing sample ' + name);
+  const blob = await res.blob();
+  await openFile(new File([blob], `${name}.jpg`, { type: 'image/jpeg' }));
+}
+
+async function trySamples() {
+  try {
+    for (const kind of ['white', 'black']) {
+      await openSample(kind);
+      const b = quadBounds(crop || FULL_QUAD);
+      calibrateFrom(kind, source.el, source.w, source.h, { x: b.x + b.w * 0.3, y: b.y + b.h * 0.3, w: b.w * 0.4, h: b.h * 0.4 }, true);
+    }
+    await openSample('sunset');
+    toast('Calibrated on the sample white and black frames. Showing the sunset; more samples are under Calibrate.', 6000);
+  } catch (err) {
+    toast('Couldn’t load the samples: ' + err.message);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -578,9 +822,9 @@ function baseName(name) {
 
 async function saveImage() {
   if (!source) return;
-  const { sw } = cropRect(source.w, source.h);
+  const { natW } = pictureGeom(source.w, source.h);
   const maxW = settings.layout === 'side' ? 2000 : 2400;
-  const W = Math.min(maxW, Math.max(1280, sw));
+  const W = Math.min(maxW, Math.max(1280, natW));
   const out = document.createElement('canvas');
   renderComposite(out, source.el, source.w, source.h, W, 2048);
   const type = settings.fileFormat === 'png' ? 'image/png' : 'image/jpeg';
@@ -700,7 +944,7 @@ function setSetting(key, value) {
     luts = rebuildLUTs();
     showCalibration();
   }
-  if (key === 'keepCrop') store.set('crop', value ? crop : null);
+  if (key === 'aspect') pictureCache.key = '';
   syncUI();
   requestRender();
 }
@@ -778,14 +1022,24 @@ function bindUI() {
   $('setBlack').addEventListener('click', () => startPick('black'));
   $('setCrop').addEventListener('click', () => startPick('crop'));
   $('clearCrop').addEventListener('click', () => {
-    crop = null;
-    store.set('crop', null);
+    setCrop(null);
     requestRender();
   });
+  $('detectCrop').addEventListener('click', () => {
+    if (!source) return;
+    if (source.kind === 'video') video.pause();
+    autoDetect(source.el, source.w, source.h);
+    requestRender();
+  });
+  $('pickAuto').addEventListener('click', pickAuto);
+  $('trySamples').addEventListener('click', trySamples);
+  document.querySelectorAll('[data-sample]').forEach((b) => b.addEventListener('click', () => {
+    openSample(b.dataset.sample).catch((err) => toast(err.message));
+  }));
   $('clearCal').addEventListener('click', () => {
     if (!calibration.white && !calibration.black) return;
     if (!confirm('Clear the stored white and black references?')) return;
-    calibration = { white: null, black: null };
+    calibration = { white: null, black: null, raster: null };
     store.set('calibration', calibration);
     luts = rebuildLUTs();
     showCalibration();
@@ -850,3 +1104,4 @@ if ('serviceWorker' in navigator && (location.protocol === 'https:' || location.
 
 // Expose a tiny hook for automated tests.
 window.__wfm = { openFile, settings, get stats() { return lastStats; }, get calibration() { return calibration; } };
+window.__wfmCrop = () => (pick && pick.quad) || crop;

@@ -1,5 +1,5 @@
 // Offline cache for the app shell. Bump VERSION when files change.
-const VERSION = 'wfm-v2';
+const VERSION = 'wfm-v3';
 const SHELL = [
   './',
   'index.html',
@@ -7,6 +7,7 @@ const SHELL = [
   'css/styles.css',
   'js/app.js',
   'js/waveform.js',
+  'js/geometry.js',
   'manifest.webmanifest',
   'icons/icon.svg',
   'icons/icon-192.png',
