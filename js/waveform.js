@@ -81,7 +81,7 @@ export function measureRegion(data) {
  *  - light: linear screen light relative to reference white (1.0 = peak white)
  *  - pqFine: HDR axis position, PQ(light * peakNits) / PQ(peakNits)  (0..1 = 0 nits..peak)
  */
-export function buildLUTs({ cameraTF = 'srgb', displayTF = 'g24', perChannel = true, white = null, black = null, peakNits = 1000 } = {}) {
+export function buildLUTs({ cameraTF = 'srgb', displayTF = 'g24', perChannel = true, white = null, black = null, peakNits = 1000, format = 'sdr' } = {}) {
   const cam = TRANSFERS[cameraTF] || TRANSFERS.srgb;
   const disp = TRANSFERS[displayTF] || TRANSFERS.g24;
   const sig = [new Float32Array(256), new Float32Array(256), new Float32Array(256)];
@@ -103,9 +103,11 @@ export function buildLUTs({ cameraTF = 'srgb', displayTF = 'g24', perChannel = t
     for (let v = 0; v < 256; v++) {
       const l = cam.toLinear(v / 255);
       if (!w) {
-        // Uncalibrated: show the photo's own code values; camera clip = peak.
+        // Uncalibrated: read the file's own code values as the video signal (like
+        // Resolve on a frame grab). Light comes from the display EOTF: the SDR gamma,
+        // or PQ for HDR (absolute nits, relative to the chosen peak).
         sig[c][v] = v / 255;
-        light[c][v] = l;
+        light[c][v] = format === 'hdr' ? pqDecode(v / 255) / peakNits : disp.toLinear(v / 255);
       } else {
         const wc = Math.max(w[c], 1e-6);
         const bc = b ? Math.min(b[c], wc * 0.999) : 0;
@@ -357,21 +359,19 @@ const STOP_LO = -20, STOP_HI = 4;
  *                       columns, rows, luts, stopsRange}
  */
 export function computeWaveform(data, width, height, opts) {
-  const { mode = 'overlay', axis = 'sdr', luts, stopsRange = 10 } = opts;
+  const { mode = 'overlay', axis = 'sdr', luts, stopsRange = 10, style = 'lines' } = opts;
   const columns = Math.max(1, opts.columns | 0);
   const rows = Math.max(2, opts.rows | 0);
   const { lo, hi } = scaleRange(axis, stopsRange);
-  const rowScale = (rows - 1) / (hi - lo);
+  // Continuous vertical position in "cell" units: row k covers [k, k + 1).
+  const cellScale = rows / (hi - lo);
+  const maxPos = rows - 1e-4;
   const stops = axis === 'stops';
-  const toRow = (v) => {
-    const r = Math.round((hi - v) * rowScale);
-    return r < 0 ? 0 : r >= rows ? rows - 1 : r;
-  };
-  const toRowStops = (l) => toRow(l > 1e-9 ? Math.log2(l) : -99);
+  const lines = style !== 'points';
 
   const nCh = mode === 'luma' ? 1 : 3;
   const bins = [];
-  for (let c = 0; c < nCh; c++) bins.push(new Uint32Array(columns * rows));
+  for (let c = 0; c < nCh; c++) bins.push(new Float32Array(columns * rows));
 
   const colMap = new Int32Array(width);
   for (let x = 0; x < width; x++) colMap[x] = Math.min(columns - 1, Math.floor((x * columns) / width));
@@ -380,12 +380,22 @@ export function computeWaveform(data, width, height, opts) {
   const lightF = luts.lightFine || luts.light;
   const axisF = axis === 'pq' ? luts.pqFine : sigF;
   const fineShift = sigF[0].length === 1024 ? 2 : 0;
-  // Per-channel row LUTs for RGB modes (row only depends on the channel value).
-  const rowLut = [0, 1, 2].map((c) => {
-    const t = new Int32Array(sigF[c].length);
-    for (let v = 0; v < t.length; v++) t[v] = stops ? toRowStops(lightF[c][v]) : toRow(axisF[c][v]);
+  // Per-channel position LUTs (position depends only on the channel value).
+  const posOf = (v) => {
+    const p = (hi - v) * cellScale;
+    return p < 0 ? 0 : p > maxPos ? maxPos : p;
+  };
+  const posLut = [0, 1, 2].map((c) => {
+    const t = new Float32Array(sigF[c].length);
+    for (let v = 0; v < t.length; v++) t[v] = posOf(stops ? (lightF[c][v] > 1e-9 ? Math.log2(lightF[c][v]) : -99) : axisF[c][v]);
     return t;
   });
+
+  // Strokes are deposited box-filtered into rows (sub-pixel accurate, anti-aliased).
+  // Full interior rows of long strokes go into a difference array (O(1) per stroke),
+  // integrated once at the end.
+  const diffs = [];
+  for (let c = 0; c < nCh; c++) diffs.push(lines ? new Float32Array(columns * (rows + 1)) : null);
 
   const sigHist = new Uint32Array(HIST_BINS);
   const lightHist = new Uint32Array(HIST_BINS);
@@ -398,12 +408,14 @@ export function computeWaveform(data, width, height, opts) {
   const dMask = fineShift ? 3 : 0;
   let seed = 0x9e3779b9;
   let clipped = 0, overWhite = 0, sum = 0, sumLight = 0;
+  const pos = [];
+  for (let c = 0; c < nCh; c++) pos.push(new Float32Array(width));
 
   for (let y = 0; y < height; y++) {
     let i = y * width * 4;
+    // 1) positions and statistics for this scan line
     for (let x = 0; x < width; x++, i += 4) {
       const r = data[i], g = data[i + 1], b = data[i + 2];
-      const col = colMap[x];
       seed ^= seed << 13; seed ^= seed >>> 17; seed ^= seed << 5;
       const ri = (r << fineShift) | (seed & dMask);
       const gi = (g << fineShift) | ((seed >>> 2) & dMask);
@@ -411,17 +423,14 @@ export function computeWaveform(data, width, height, opts) {
       const ys = kr * sR[ri] + kg * sG[gi] + kb * sB[bi];
       const yl = kr * lR[ri] + kg * lG[gi] + kb * lB[bi];
       const lg = yl > 1e-9 ? Math.log2(yl) : -99;
-
       if (nCh === 1) {
         // Y' from the encoded channels, as a Y waveform does.
-        const v = stops ? lg : kr * aR[ri] + kg * aG[gi] + kb * aB[bi];
-        bins[0][toRow(v) * columns + col]++;
+        pos[0][x] = posOf(stops ? lg : kr * aR[ri] + kg * aG[gi] + kb * aB[bi]);
       } else {
-        bins[0][rowLut[0][ri] * columns + col]++;
-        bins[1][rowLut[1][gi] * columns + col]++;
-        bins[2][rowLut[2][bi] * columns + col]++;
+        pos[0][x] = posLut[0][ri];
+        pos[1][x] = posLut[1][gi];
+        pos[2][x] = posLut[2][bi];
       }
-
       let hb = ((ys - SIG_LO) * sigBinScale) | 0;
       sigHist[hb < 0 ? 0 : hb >= HIST_BINS ? HIST_BINS - 1 : hb]++;
       hb = ((lg - STOP_LO) * stopBinScale) | 0;
@@ -430,6 +439,58 @@ export function computeWaveform(data, width, height, opts) {
       if (yl > 1.01) overWhite++;
       sum += ys;
       sumLight += yl;
+    }
+    // 2) draw the scan line like a waveform monitor's beam: each pixel owns the
+    //    segment from halfway to its left neighbour to halfway to its right one.
+    for (let c = 0; c < nCh; c++) {
+      const P = pos[c], bin = bins[c], D = diffs[c];
+      for (let x = 0; x < width; x++) {
+        const p = P[x], col = colMap[x];
+        if (!lines) {
+          const cc = p - 0.5;
+          const k = cc < 0 ? 0 : Math.floor(cc), f = cc < 0 ? 0 : cc - k;
+          if (k >= rows - 1) { bin[(rows - 1) * columns + col] += 1; continue; }
+          bin[k * columns + col] += 1 - f;
+          bin[(k + 1) * columns + col] += f;
+          continue;
+        }
+        // stroke over [a, b] with weight 1: the two half-segments around this pixel
+        const l = x > 0 ? (P[x - 1] + p) * 0.5 : p;
+        const r = x < width - 1 ? (P[x + 1] + p) * 0.5 : p;
+        for (let half = 0; half < 2; half++) {
+          let a = half ? p : l, b = half ? r : p;
+          if (a > b) { const t = a; a = b; b = t; }
+          if (b - a < 0.05) {
+            const cc = (a + b) * 0.5 - 0.5;
+            const k = cc < 0 ? 0 : Math.floor(cc), f = cc < 0 ? 0 : cc - k;
+            if (k >= rows - 1) { bin[(rows - 1) * columns + col] += 0.5; continue; }
+            bin[k * columns + col] += 0.5 * (1 - f);
+            bin[(k + 1) * columns + col] += 0.5 * f;
+            continue;
+          }
+          const dens = 0.5 / (b - a);
+          const k0 = Math.floor(a), k1 = Math.min(rows - 1, Math.floor(b));
+          if (k0 === k1) { bin[k0 * columns + col] += 0.5; continue; }
+          bin[k0 * columns + col] += dens * (k0 + 1 - a);
+          bin[k1 * columns + col] += dens * (b - k1);
+          if (k1 > k0 + 1) {
+            D[(k0 + 1) * columns + col] += dens;
+            D[k1 * columns + col] -= dens;
+          }
+        }
+      }
+    }
+  }
+  if (lines) {
+    for (let c = 0; c < nCh; c++) {
+      const D = diffs[c], bin = bins[c];
+      for (let col = 0; col < columns; col++) {
+        let run = 0;
+        for (let k = 0; k < rows; k++) {
+          run += D[k * columns + col];
+          bin[k * columns + col] += run;
+        }
+      }
     }
   }
 
@@ -474,8 +535,8 @@ const TRACE_COLORS = {
 /**
  * Convert accumulated bins to RGBA buffers (alpha = intensity), one per channel.
  * Like Resolve, brightness follows *density*: a lone stray sample is barely visible,
- * while many samples landing together build a bright line. Bins are smoothed with a
- * [1 2 1] kernel both ways first, so traces read as continuous strokes.
+ * while many samples landing together build a bright line. No smoothing: each bin
+ * maps to exactly one plot pixel.
  */
 export function traceToRGBA(wf, gain = 1.5) {
   const { bins, columns, rows, samplesPerColumn } = wf;
@@ -485,23 +546,8 @@ export function traceToRGBA(wf, gain = 1.5) {
   const modeGain = wf.mode === 'overlay' ? 0.75 : 1;
   const colors = bins.length === 1 ? TRACE_COLORS.luma : TRACE_COLORS.rgb;
   const out = [];
-  const tmp = new Float32Array(columns * rows);
   for (let ch = 0; ch < bins.length; ch++) {
-    const raw = bins[ch];
-    // horizontal [1 2 1]
-    for (let r = 0; r < rows; r++) {
-      const o = r * columns;
-      for (let c = 0; c < columns; c++) {
-        const l = c > 0 ? raw[o + c - 1] : raw[o + c], rr = c < columns - 1 ? raw[o + c + 1] : raw[o + c];
-        tmp[o + c] = (l + 2 * raw[o + c] + rr) * 0.25;
-      }
-    }
-    // vertical [1 2 1]
-    const b = new Float32Array(columns * rows);
-    for (let r = 0; r < rows; r++) {
-      const up = (r > 0 ? r - 1 : r) * columns, me = r * columns, dn = (r < rows - 1 ? r + 1 : r) * columns;
-      for (let c = 0; c < columns; c++) b[me + c] = (tmp[up + c] + 2 * tmp[me + c] + tmp[dn + c]) * 0.25;
-    }
+    const b = bins[ch];
     const px = new Uint8ClampedArray(columns * rows * 4);
     const [cr, cg, cb] = colors[ch];
     for (let i = 0, j = 0; i < b.length; i++, j += 4) {
@@ -509,7 +555,7 @@ export function traceToRGBA(wf, gain = 1.5) {
       if (cnt <= 0) continue;
       // 1 - exp(-(d)^1.4): soft toe keeps sparse noise dim, dense traces saturate.
       const d = cnt * g;
-      const a = modeGain * (1 - Math.exp(-Math.pow(d, 1.4)));
+      const a = modeGain * (1 - Math.exp(-Math.pow(d, 1.6)));
       if (a < 0.004) continue;
       const hot = a > 0.8 ? (a - 0.8) / 0.2 : 0;
       px[j] = cr + (255 - cr) * hot * 0.55;
@@ -571,7 +617,7 @@ export function drawScope(ctx, wf, x, y, w, h, opts = {}) {
     ctx.fillRect(x, y, w, h);
   }
 
-  const valueToY = (v) => y + ((hi - v) / (hi - lo)) * (h - 1);
+  const valueToY = (v) => y + ((hi - v) / (hi - lo)) * h;
   const lines = graticule(wf.axis, opts.unit, { ...opts, stopsRange: wf.stopsRange });
   const peakValue = wf.axis === 'stops' ? 0 : 1;
 
@@ -629,7 +675,8 @@ export function drawScope(ctx, wf, x, y, w, h, opts = {}) {
   ctx.beginPath();
   ctx.rect(x, y, w, h);
   ctx.clip();
-  ctx.imageSmoothingEnabled = true;
+  // Pixel-exact: the trace is accumulated at the plot's own resolution.
+  ctx.imageSmoothingEnabled = wf.columns < panelW - 1 || wf.rows < h - 1;
   ctx.globalCompositeOperation = 'lighter';
   for (let ch = 0; ch < rgba.length; ch++) {
     tctx.putImageData(new ImageData(rgba[ch], wf.columns, wf.rows), 0, 0);

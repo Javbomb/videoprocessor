@@ -61,9 +61,11 @@ test('flat field lands in a single waveform row per column', () => {
   const wf = computeWaveform(solid(w, h, 128, 128, 128), w, h, { mode: 'luma', axis: 'sdr', columns: 32, rows: 100, luts });
   const b = wf.bins[0];
   const { lo, hi } = scaleRange('sdr');
-  const expectedRow = Math.round((hi - 128 / 255) * (99 / (hi - lo)));
+  const p = (hi - 128 / 255) * (100 / (hi - lo)); // continuous position, row k covers [k, k+1)
+  const k = Math.floor(p - 0.5);
   for (let col = 0; col < 32; col++) {
-    assert.equal(b[expectedRow * 32 + col], h * 2, `col ${col}`);
+    const near = b[k * 32 + col] + b[(k + 1) * 32 + col];
+    assert.ok(Math.abs(near - h * 2) < 1e-3, `col ${col}: ${near}`);
   }
   assert.ok(Math.abs(wf.stats.peak - 128 / 255) < 0.002);
   assert.ok(Math.abs(wf.stats.floor - 128 / 255) < 0.002);
@@ -89,7 +91,7 @@ test('stops scale accumulates without overflow', () => {
   const luts = buildLUTs({ white });
   const wf = computeWaveform(solid(16, 16, 0, 0, 0), 16, 16, { mode: 'luma', axis: 'stops', columns: 16, rows: 50, luts, stopsRange: 10 });
   const total = wf.bins[0].reduce((a, b) => a + b, 0);
-  assert.equal(total, 256);
+  assert.ok(Math.abs(total - 256) < 1e-3);
 });
 
 test('PQ matches ST 2084 reference points', () => {
@@ -109,8 +111,9 @@ test('HDR: reference white sits at the top of the PQ axis, half light lower', ()
   assert.ok(Math.abs(mid - pqEncode(1000 * 128 / 255) / pqEncode(1000)) < 0.01);
   const wf = computeWaveform(solid(8, 8, 255, 255, 255), 8, 8, { mode: 'overlay', axis: 'pq', columns: 8, rows: 111, luts });
   const { lo, hi } = scaleRange('pq');
-  const topRow = Math.round((hi - 1) * (110 / (hi - lo)));
-  assert.equal(wf.bins[0][topRow * 8], 8);
+  const p = (hi - 1) * (111 / (hi - lo));
+  const k = Math.floor(p - 0.5);
+  assert.ok(Math.abs(wf.bins[0][k * 8] + wf.bins[0][(k + 1) * 8] - 8) < 1e-3);
 });
 
 test('legends: top line is the chosen peak', () => {
@@ -169,4 +172,47 @@ test('low-pass filter keeps flat areas and removes noise', async () => {
   assert.ok(s1 < s0 / 4, `noise ${s0.toFixed(1)} -> ${s1.toFixed(1)}`);
   assert.equal(lowPassRadius('off', 1280), 0);
   assert.ok(lowPassRadius('high', 1280) > lowPassRadius('low', 1280));
+});
+
+test('ADL averages linear light; APL averages the gamma-encoded signal', () => {
+  // Projector at gamma 2.4 showing a full-screen 50 IRE grey emits 0.5^2.4 = 19% of peak light.
+  // The phone (sRGB) photographs the white patch at code 255 and the grey at sRGB(0.19).
+  const white = measureRegion(solid(4, 4, 255, 255, 255));
+  const luts = buildLUTs({ white, cameraTF: 'srgb', displayTF: 'g24' });
+  const lightGrey = Math.pow(0.5, 2.4);
+  const code = Math.round(TRANSFERS.srgb.fromLinear(lightGrey) * 255);
+  const wf = computeWaveform(solid(64, 32, code, code, code), 64, 32, { mode: 'luma', axis: 'sdr', columns: 64, rows: 100, luts });
+  assert.ok(Math.abs(wf.stats.mean - 0.5) < 0.01, `APL ${wf.stats.mean}`);
+  assert.ok(Math.abs(wf.stats.meanLight - lightGrey) < 0.006, `ADL ${wf.stats.meanLight}`);
+  // Half the frame 100% white, half black: ADL 50% of peak light, APL 50 IRE.
+  const half = solid(64, 32, 0, 0, 0);
+  for (let i = 0; i < half.length; i += 4) if ((i / 4) % 64 < 32) half[i] = half[i + 1] = half[i + 2] = 255;
+  const wf2 = computeWaveform(half, 64, 32, { mode: 'luma', axis: 'sdr', columns: 64, rows: 100, luts });
+  assert.ok(Math.abs(wf2.stats.meanLight - 0.5) < 0.01);
+  assert.ok(Math.abs(wf2.stats.mean - 0.5) < 0.01);
+});
+
+test('uncalibrated frame grabs decode with the display EOTF (gamma 2.4 / PQ)', () => {
+  const sdr = buildLUTs({ displayTF: 'g24' });
+  assert.ok(Math.abs(sdr.light[1][128] - Math.pow(128 / 255, 2.4)) < 1e-6);
+  const hdr = buildLUTs({ format: 'hdr', peakNits: 1000 });
+  assert.ok(Math.abs(hdr.light[1][128] * 1000 - pqDecode(128 / 255)) < 1e-3);
+  // PQ code value maps straight onto the PQ axis
+  assert.ok(Math.abs(hdr.pqFine[1][128 * 4 + 1] - (128 / 255) / pqEncode(1000)) < 0.003);
+});
+
+test('line mode joins neighbouring pixels: an edge becomes a faint vertical stroke', () => {
+  const w = 16, h = 4;
+  const d = solid(w, h, 30, 30, 30);
+  for (let y = 0; y < h; y++) for (let x = 8; x < w; x++) { const o = (y * w + x) * 4; d[o] = d[o + 1] = d[o + 2] = 220; }
+  const luts = buildLUTs();
+  const wf = computeWaveform(d, w, h, { mode: 'luma', axis: 'sdr', columns: w, rows: 200, luts });
+  const col = (c) => { let n = 0; for (let r = 0; r < 200; r++) if (wf.bins[0][r * w + c] > 0) n++; return n; };
+  assert.ok(col(3) <= 2, 'flat area is a thin line');
+  assert.ok(col(7) > 30 && col(8) > 30, 'edge columns carry a vertical stroke');
+  const total = wf.bins[0].reduce((a, b) => a + b, 0);
+  assert.ok(Math.abs(total - w * h) < 1e-3, 'every pixel deposits exactly 1');
+  const pts = computeWaveform(d, w, h, { mode: 'luma', axis: 'sdr', columns: w, rows: 200, luts, style: 'points' });
+  let n7 = 0; for (let r = 0; r < 200; r++) if (pts.bins[0][r * w + 7] > 0) n7++;
+  assert.ok(n7 <= 2, 'points mode has no stroke');
 });

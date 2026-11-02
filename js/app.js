@@ -22,7 +22,7 @@ const store = {
 const DEFAULTS = {
   mode: 'overlay', format: 'sdr', scale: 'percent', sdrPeak: 100, hdrPeak: 1000, stopsRange: 12, gain: 2.2,
   cameraTF: 'srgb', displayTF: 'g24', perChannel: true,
-  layout: 'stacked', burnStats: true, lowpass: 'high', fileFormat: 'jpeg', cropOnLoad: 'detect', aspect: 'auto',
+  layout: 'stacked', burnStats: true, lowpass: 'off', trace: 'lines', fileFormat: 'png', cropOnLoad: 'detect', aspect: 'auto',
 };
 const settings = { ...DEFAULTS, ...store.get('settings', {}) };
 if (settings.format !== 'sdr' && settings.format !== 'hdr') settings.format = 'sdr'; // older versions stored the file type here
@@ -151,18 +151,20 @@ function getPicture(frame, frameW, frameH, outW) {
 }
 
 /** Render the composite of `frame` into `canvas` with image width W. Returns stats. */
-function renderComposite(canvas, frame, frameW, frameH, W, analysisMax) {
-  const pic = getPicture(frame, frameW, frameH, Math.max(W, analysisMax));
+function renderComposite(canvas, frame, frameW, frameH, W, analysisMax, fast = false) {
+  const pic = getPicture(frame, frameW, frameH, Math.max(W, Math.min(analysisMax, frameW)));
   const aspect = pic.aspect;
   const d = layoutDims(W, aspect);
   if (canvas.width !== d.cw) canvas.width = d.cw;
   if (canvas.height !== d.ch) canvas.height = d.ch;
   const ctx = canvas.getContext('2d');
 
-  // Analysis pass on a down-scaled copy of the picture.
-  let aw = Math.min(pic.natW, analysisMax);
+  // Analysis at full resolution: never fewer source columns than scope columns,
+  // so the trace is drawn 1:1 instead of being stretched.
+  const panelPx = Math.round(settings.mode === 'parade' ? d.scope.w / 3 : d.scope.w);
+  // (While video plays, cap the work so it keeps up; a paused frame re-renders in full.)
+  let aw = fast ? Math.min(panelPx, analysisMax) : Math.max(Math.min(pic.natW, analysisMax), panelPx);
   let ah = aw * aspect;
-  if (ah > analysisMax) { ah = analysisMax; aw = ah / aspect; }
   aw = Math.max(8, Math.round(aw));
   ah = Math.max(8, Math.round(ah));
   if (work.width !== aw) work.width = aw;
@@ -172,14 +174,14 @@ function renderComposite(canvas, frame, frameW, frameH, W, analysisMax) {
   const data = workCtx.getImageData(0, 0, aw, ah).data;
   lowPassRGBA(data, aw, ah, lowPassRadius(settings.lowpass, aw));
 
-  const panelW = settings.mode === 'parade' ? d.scope.w / 3 : d.scope.w;
   const wf = computeWaveform(data, aw, ah, {
     mode: settings.mode,
     axis: axisFor(settings.format, settings.scale),
-    columns: Math.min(Math.round(panelW), aw),
+    columns: Math.min(panelPx, aw),
     rows: d.scope.h,
     luts,
     stopsRange: Number(settings.stopsRange),
+    style: settings.trace,
   });
 
   ctx.fillStyle = '#0b0d0e';
@@ -234,9 +236,10 @@ function render() {
     const d = layoutDims(W, aspect);
     fitCanvasCSS(d.ch / d.cw);
   }
-  const analysis = source.kind === 'image' ? 1280 : 640;
+  const moving = source.kind === 'camera' || (source.kind === 'video' && !video.paused && !video.ended);
   try {
-    lastStats = renderComposite(view, source.el, source.w, source.h, W, analysis);
+    // Preview: one source pixel per scope column; moving video: capped at 720 columns.
+    lastStats = renderComposite(view, source.el, source.w, source.h, W, moving ? 720 : 0, moving);
     showStats(lastStats);
   } catch (err) {
     console.error(err);
@@ -323,6 +326,7 @@ const PEAK_PRESETS = { sdr: [48, 100, 150, 200], hdr: [600, 1000, 4000, 10000] }
 function rebuildLUTs() {
   return buildLUTs({
     peakNits: peakNits(),
+    format: settings.format,
     cameraTF: settings.cameraTF,
     displayTF: settings.displayTF,
     perChannel: settings.perChannel,
@@ -842,10 +846,11 @@ function baseName(name) {
 async function saveImage() {
   if (!source) return;
   const { natW } = pictureGeom(source.w, source.h);
-  const maxW = settings.layout === 'side' ? 2000 : 2400;
-  const W = Math.min(maxW, Math.max(1280, natW));
+  // High-resolution export: at least 1920 scope columns (side by side: 1600 each).
+  const [minW, maxW] = settings.layout === 'side' ? [1600, 2400] : [1920, 3072];
+  const W = Math.min(maxW, Math.max(minW, natW));
   const out = document.createElement('canvas');
-  renderComposite(out, source.el, source.w, source.h, W, 2048);
+  renderComposite(out, source.el, source.w, source.h, W, 3072);
   const type = settings.fileFormat === 'png' ? 'image/png' : 'image/jpeg';
   const blob = await new Promise((r) => out.toBlob(r, type, 0.93));
   if (!blob) return toast('Could not create the image.');
@@ -1081,7 +1086,7 @@ function bindUI() {
     if (video.duration) video.currentTime = (e.target.value / 1000) * video.duration;
   });
   video.addEventListener('play', () => { updatePlayUI(); startLoop(); });
-  video.addEventListener('pause', updatePlayUI);
+  video.addEventListener('pause', () => { updatePlayUI(); requestRender(); });
   video.addEventListener('seeked', () => { updatePlayUI(); requestRender(); });
   video.addEventListener('timeupdate', updatePlayUI);
   video.addEventListener('ended', () => {
