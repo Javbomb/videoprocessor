@@ -13,9 +13,10 @@ It runs on iPhone and Android with no app store. Open the page and choose *Add t
   - **HDR (PQ, SMPTE ST 2084):** a PQ-spaced axis like Resolve's HDR scopes, topped at the chosen peak. The legend can be **nits**, **% of peak** light, or **PQ code values** (e.g. 1,000 nits = 769).
   - **Stops:** for either signal type, a log scale of light below peak white.
 - **Calibrate:** *Set white* on a shot of a 100% white frame. *Set black* on a 0% black frame (optional). After that, 1023 / 100% is the projector's peak white, and the stops scale shows the measured black floor as a dashed blue line. The app also reports the projector's contrast as the camera saw it. Calibration is saved on the phone.
-- **Crop** to the projected picture so the scope's columns line up with the image. Turn on "keep crop" if you shoot from a tripod.
-- **Output:** save a new JPEG/PNG as **top/bottom**, **side-by-side**, **overlay** (scope over the lower part of the image) or **scope only**, with optional burned-in stats. For videos and the live camera, **Record** makes a new video with the scope composed in.
-- **Stats:** peak / floor / mean signal level, stops of light used, camera clipping, and the amount of the picture above reference white.
+- **Picture detection:** the projected picture is found automatically and **keystone-corrected**, because a photo never shows only the picture. The detector finds the outer lit raster, trims letterbox/pillarbox bars that appear on both opposite sides, and places each edge to sub-pixel accuracy. The raster found on the white calibration frame is remembered and reused for later shots, which is the most reliable mode. *Adjust corners* lets you drag the four corners, with a magnifier. *New files* can be set to Detect, Keep area (tripod) or Whole photo. *Picture shape* can force 16:9, 2.39:1 and so on.
+- **Output:** save a new JPEG/PNG as **top/bottom**, **side-by-side**, **overlay** (scope over the image) or **scope only**. The scope is always as tall as the picture. Stats can be burned in. For videos and the live camera, **Record** makes a new video with the scope composed in.
+- **Stats:** peak and floor, **APL** (average picture level: the mean signal, in IRE for SDR), **ADL** (average display level: the mean light on screen as % of peak white and in nits; the frame-average light level), stops of light used, camera clipping, and the share of the picture above reference white.
+- **Sample photos:** *Try it with sample photos* calibrates on simulated white and black frames and opens a sunset scene. More samples are under Calibrate.
 - `patterns.html` provides white, black, step, ramp, checkerboard and window test patterns to show on the projector.
 
 ## Getting accurate results
@@ -40,5 +41,7 @@ The app is static files with no build step. The live camera and *Add to Home Scr
 ## Code
 
 - `js/waveform.js` — transfer functions, calibration LUTs, waveform accumulation (with sub-code dithering so 8-bit sources don't band), statistics and scope rendering. Has no DOM dependencies, so it can be unit tested.
+- `js/geometry.js` — picture detection, homography and perspective warp (no DOM; unit tested).
+- `samples/generate.py` — renders the sample photos: procedural content projected through a simulated projector (gamma 2.4, ~2000:1, hotspot) onto a keystoned screen in a room, then "photographed" (glare, vignetting, noise, sRGB, JPEG). `--content your.jpg` simulates your own image on the screen.
 - `js/app.js` — UI, gallery/video/camera sources, region picking, compositing, saving and recording.
-- `tests/` — `node --test waveform-app/tests/waveform.test.mjs`
+- `tests/` — `node --test waveform-app/tests/*.test.mjs`

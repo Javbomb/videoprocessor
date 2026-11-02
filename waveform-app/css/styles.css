@@ -253,6 +253,7 @@ select {
   vertical-align: -1px;
   border: 1px solid var(--line);
 }
+.samples { margin-top: 14px; padding-top: 10px; border-top: 1px solid var(--line); }
 .camcontrols { margin-top: 14px; padding-top: 10px; border-top: 1px solid var(--line); }
 .camcontrols[hidden] { display: none; }
 

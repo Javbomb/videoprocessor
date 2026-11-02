@@ -229,30 +229,41 @@ export function graticule(axis, unit, o = {}) {
 }
 
 /**
- * Format the peak / floor / mean statistics for display.
+ * Format the statistics for display.
+ *  peak / floor: in the selected unit
+ *  apl: average picture level, the mean *signal* (IRE in SDR, PQ code/percent in HDR)
+ *  adl: average display level, the mean *light* on screen as % of peak white and in nits
  * o: {format: 'sdr'|'hdr', unit, peakNits}
  */
 export function formatStats(stats, o) {
   const { format = 'sdr', unit = 'percent', peakNits = 100 } = o;
   const nits = { peak: peakNits * 2 ** stats.peakStops, floor: peakNits * 2 ** stats.floorStops, mean: peakNits * stats.meanLight };
   const each = (fn) => ({ peak: fn('peak'), floor: fn('floor'), mean: fn('mean') });
-  if (unit === 'nits' || (unit === 'stops' && format === 'hdr')) return each((k) => fmtNits(nits[k]) + ' nits');
-  if (format === 'sdr' && unit === 'code') return each((k) => String(Math.round(stats[k] * 1023)));
-  if (format === 'sdr') return each((k) => (stats[k] * 100).toFixed(0) + ' IRE');
-  if (unit === 'code') return each((k) => String(Math.round(pqEncode(nits[k]) * 1023)));
-  return each((k) => {
-    const p = (nits[k] / peakNits) * 100;
-    return (p < 10 ? p.toFixed(1) : p.toFixed(0)) + '%';
-  });
+  let f;
+  if (unit === 'nits' || (unit === 'stops' && format === 'hdr')) f = each((k) => fmtNits(nits[k]) + ' nits');
+  else if (format === 'sdr' && unit === 'code') f = each((k) => String(Math.round(stats[k] * 1023)));
+  else if (format === 'sdr') f = each((k) => (stats[k] * 100).toFixed(0) + ' IRE');
+  else if (unit === 'code') f = each((k) => String(Math.round(pqEncode(nits[k]) * 1023)));
+  else f = each((k) => pct((nits[k] / peakNits) * 100));
+  const adlPct = stats.meanLight * 100;
+  return {
+    ...f,
+    apl: format === 'sdr' ? (unit === 'code' ? String(Math.round(stats.mean * 1023)) : (stats.mean * 100).toFixed(0) + ' IRE') : null,
+    adl: `${pct(adlPct)} (${fmtNits(nits.mean)} nits)`,
+    adlPct,
+    adlNits: nits.mean,
+  };
 }
+
+const pct = (p) => (p < 10 ? p.toFixed(1) : p.toFixed(0)) + '%';
 
 /** Two short lines of stats to burn into the scope. */
 export function statsLines(stats, o) {
   const f = formatStats(stats, o);
   const cal = o.calibrated ? '' : ' (uncalibrated)';
   return [
-    `Peak ${f.peak}  Floor ${f.floor}  Mean ${f.mean}`,
-    `Light ${stats.rangeStops.toFixed(1)} stops, peak ${stats.peakStops.toFixed(1)} st${cal}`,
+    `Peak ${f.peak}  Floor ${f.floor}${f.apl ? '  APL ' + f.apl : ''}`,
+    `ADL ${f.adl}  ${stats.rangeStops.toFixed(1)} stops${cal}`,
   ];
 }
 

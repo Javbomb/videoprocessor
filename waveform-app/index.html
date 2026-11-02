@@ -41,11 +41,13 @@
             <li>Open shots of your content taken at the same exposure. The waveform now reads 100% / 1023 at projector peak white.</li>
           </ol>
           <p><a href="patterns.html" target="_blank" rel="noopener">Test patterns</a> to put on the projector.</p>
+          <p><button id="trySamples" class="btn" type="button">Try it with sample photos</button></p>
         </div>
       </div>
       <div id="pickBar" class="pickbar" hidden>
         <span id="pickHint">Drag a box</span>
         <span class="spacer"></span>
+        <button id="pickAuto" class="btn" type="button" hidden>Auto</button>
         <button id="pickCancel" class="btn" type="button">Cancel</button>
         <button id="pickOk" class="btn primary" type="button" disabled>Use region</button>
       </div>
@@ -143,6 +145,15 @@
         </select>
       </div>
       <label class="check"><input type="checkbox" data-setting="perChannel"> Per-channel white (neutralise the camera's white balance)</label>
+      <div class="samples">
+        <span class="label">Sample photos</span>
+        <div class="row">
+          <button class="btn ghost" type="button" data-sample="white">White</button>
+          <button class="btn ghost" type="button" data-sample="black">Black</button>
+          <button class="btn ghost" type="button" data-sample="sunset">Sunset</button>
+          <button class="btn ghost" type="button" data-sample="chart">Chart</button>
+        </div>
+      </div>
       <div id="camControls" class="camcontrols" hidden>
         <span class="label">Live camera</span>
         <div class="row">
@@ -156,12 +167,31 @@
     </section>
 
     <section class="panel" data-panel="crop" hidden>
-      <p class="hint">Crop to the projected picture so each scope column lines up with the picture.</p>
+      <p class="hint">The scope measures only the projected picture. Its edges are found automatically and keystone is straightened out. Detection is most reliable on the white calibration frame, which is remembered for later shots from the same spot.</p>
       <div class="row">
-        <button id="setCrop" class="btn primary" type="button" disabled>Select picture area</button>
-        <button id="clearCrop" class="btn ghost" type="button">Reset</button>
+        <button id="detectCrop" class="btn primary" type="button" disabled>Auto-detect</button>
+        <button id="setCrop" class="btn" type="button" disabled>Adjust corners</button>
+        <button id="clearCrop" class="btn ghost" type="button">Whole photo</button>
       </div>
-      <label class="check"><input type="checkbox" data-setting="keepCrop"> Keep crop for the next files (tripod)</label>
+      <div class="field">
+        <span class="label">New files</span>
+        <div class="seg" data-setting="cropOnLoad">
+          <button data-value="detect">Detect</button>
+          <button data-value="keep">Keep area</button>
+          <button data-value="full">Whole photo</button>
+        </div>
+      </div>
+      <div class="field">
+        <label class="label" for="aspect">Picture shape</label>
+        <select id="aspect" data-setting="aspect">
+          <option value="auto">Auto (from corners)</option>
+          <option value="16:9">16:9</option>
+          <option value="1.85">1.85:1</option>
+          <option value="2.39">2.39:1</option>
+          <option value="4:3">4:3</option>
+          <option value="3:2">3:2</option>
+        </select>
+      </div>
     </section>
 
     <section class="panel" data-panel="output" hidden>

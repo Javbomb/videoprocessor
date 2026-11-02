@@ -143,3 +143,13 @@ test('stats are reported in the selected unit', () => {
   assert.equal(formatStats(s, { format: 'sdr', unit: 'code', peakNits: 100 }).peak, '921');
   assert.equal(formatStats(s, { format: 'sdr', unit: 'nits', peakNits: 100 }).mean, '25 nits');
 });
+
+test('ADL is the mean light relative to peak, APL the mean signal', () => {
+  const s = { peak: 0.9, floor: 0.1, mean: 0.5, meanLight: 0.25, peakStops: -1, floorStops: -8, rangeStops: 7 };
+  const hdr = formatStats(s, { format: 'hdr', unit: 'nits', peakNits: 1000 });
+  assert.equal(hdr.adl, '25% (250 nits)');
+  assert.equal(hdr.apl, null);
+  const sdr = formatStats(s, { format: 'sdr', unit: 'percent', peakNits: 100 });
+  assert.equal(sdr.apl, '50 IRE');
+  assert.equal(sdr.adl, '25% (25 nits)');
+});

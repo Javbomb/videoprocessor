@@ -23,7 +23,7 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-      - run: node --test waveform-app/tests/waveform.test.mjs
+      - run: node --test waveform-app/tests/*.test.mjs
 
   deploy:
     needs: test
