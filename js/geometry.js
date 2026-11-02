@@ -460,9 +460,9 @@ function trimBars(data, lin, w, h, raster) {
   let t = run(rowMax, 0, 1) / RH, b = run(rowMax, RH - 1, -1) / RH;
   if (!(l > minBand && r > minBand) || l + r > 0.8) { l = 0; r = 0; }
   if (!(t > minBand && b > minBand) || t + b > 0.8) { t = 0; b = 0; }
-  if (!l && !r && !t && !b) return { quad: raster, trimmed: false };
+  if (!l && !r && !t && !b) return { quad: raster, trimmed: false, lr: false, tb: false };
   const H = squareToQuad(raster);
-  return { quad: [[l, t], [1 - r, t], [1 - r, 1 - b], [l, 1 - b]].map(([u, v]) => mapUV(H, u, v)), trimmed: true };
+  return { quad: [[l, t], [1 - r, t], [1 - r, 1 - b], [l, 1 - b]].map(([u, v]) => mapUV(H, u, v)), trimmed: true, lr: !!(l || r), tb: !!(t || b) };
 }
 
 /**
@@ -487,7 +487,17 @@ export function detectPicture(data, w, h, opts = {}) {
     raster = opts.raster.map(([x, y]) => [x * w, y * h]);
   } else {
     const r = findRaster(lum, lin, w, h);
-    if (!r) return null;
+    if (!r || !r.ok) {
+      // Maybe a frame grab / screenshot: the picture fills the frame apart from
+      // letterbox OR pillarbox bars (a room photo would be dark on all four sides).
+      const full = [[0, 0], [w, 0], [w, h], [0, h]];
+      const fb = trimBars(data, lin, w, h, full);
+      if (fb.trimmed && fb.lr !== fb.tb) {
+        const norm = (q) => q.map(([x, y]) => [x / w, y / h]);
+        return { quad: insetQuad(norm(fb.quad), 0.002), raster: norm(full), trimmed: true, ok: true, frame: true };
+      }
+      if (!r) return null;
+    }
     raster = refineQuad(lin, w, h, r.q);
     info = { ok: r.ok, contrast: r.contrast, fill: r.fill };
   }

@@ -1,5 +1,5 @@
 import { FULL_QUAD, rectToQuad, isAxisAligned, quadBounds, quadAspect, warpQuad, detectPicture } from './geometry.js';
-import { buildLUTs, computeWaveform, drawScope, statsLines, formatStats, measureRegion, axisFor, fmtNits, LUMA, TRANSFERS } from './waveform.js';
+import { buildLUTs, computeWaveform, drawScope, scopePadding, denoiseRGBA, statsLines, formatStats, measureRegion, axisFor, fmtNits, LUMA, TRANSFERS } from './waveform.js';
 
 // ---------------------------------------------------------------------------
 // Persistent state
@@ -22,7 +22,7 @@ const store = {
 const DEFAULTS = {
   mode: 'overlay', format: 'sdr', scale: 'percent', sdrPeak: 100, hdrPeak: 1000, stopsRange: 12, gain: 1.5,
   cameraTF: 'srgb', displayTF: 'g24', perChannel: true,
-  layout: 'stacked', burnStats: true, fileFormat: 'jpeg', cropOnLoad: 'detect', aspect: 'auto',
+  layout: 'stacked', burnStats: true, denoise: true, fileFormat: 'jpeg', cropOnLoad: 'detect', aspect: 'auto',
 };
 const settings = { ...DEFAULTS, ...store.get('settings', {}) };
 if (settings.format !== 'sdr' && settings.format !== 'hdr') settings.format = 'sdr'; // older versions stored the file type here
@@ -74,19 +74,32 @@ const workCtx = work.getContext('2d', { willReadFrequently: true });
 
 const even = (v) => Math.max(2, Math.round(v / 2) * 2);
 
-// The scope is always as tall as the picture.
+const measureCtx = document.createElement('canvas').getContext('2d');
+
+/** Gutter / strips around the scope plot for its legend, stats and caption. */
+function scopePads(W, ih) {
+  const plotW = settings.mode === 'parade' ? W : W; // legend sits left of the whole plot
+  return scopePadding(measureCtx, plotW, ih, axisFor(settings.format, settings.scale), settings.scale, {
+    peakNits: peakNits(), displayTF: settings.displayTF, stopsRange: Number(settings.stopsRange), stats: settings.burnStats,
+  });
+}
+
+// The scope plot is always exactly as tall (and, except side-by-side, as wide and
+// aligned with) the picture; the legend lives in margins around it.
 function layoutDims(W, aspect) {
   W = even(W);
   const ih = even(W * aspect);
+  const p = scopePads(W, ih);
+  const { left: L, top: T, bottom: B, right: R } = p;
   switch (settings.layout) {
     case 'side':
-      return { cw: W * 2, ch: ih, img: { x: 0, y: 0, w: W, h: ih }, scope: { x: W, y: 0, w: W, h: ih } };
+      return { cw: W + L + W + R, ch: T + ih + B, img: { x: 0, y: T, w: W, h: ih }, scope: { x: W + L, y: T, w: W, h: ih }, pad: p };
     case 'overlay':
-      return { cw: W, ch: ih, img: { x: 0, y: 0, w: W, h: ih }, scope: { x: 0, y: 0, w: W, h: ih }, overlay: true };
+      return { cw: L + W + R, ch: T + ih + B, img: { x: L, y: T, w: W, h: ih }, scope: { x: L, y: T, w: W, h: ih }, overlay: true, pad: p };
     case 'scope':
-      return { cw: W, ch: ih, img: null, scope: { x: 0, y: 0, w: W, h: ih } };
+      return { cw: L + W + R, ch: T + ih + B, img: null, scope: { x: L, y: T, w: W, h: ih }, pad: p };
     default:
-      return { cw: W, ch: ih * 2, img: { x: 0, y: 0, w: W, h: ih }, scope: { x: 0, y: ih, w: W, h: ih } };
+      return { cw: L + W + R, ch: ih + T + ih + B, img: { x: L, y: 0, w: W, h: ih }, scope: { x: L, y: ih + T, w: W, h: ih }, pad: p };
   }
 }
 
@@ -157,6 +170,7 @@ function renderComposite(canvas, frame, frameW, frameH, W, analysisMax) {
   workCtx.imageSmoothingQuality = 'medium';
   workCtx.drawImage(pic.el, pic.sx, pic.sy, pic.sw, pic.sh, 0, 0, aw, ah);
   const data = workCtx.getImageData(0, 0, aw, ah).data;
+  if (settings.denoise) denoiseRGBA(data, aw, ah);
 
   const panelW = settings.mode === 'parade' ? d.scope.w / 3 : d.scope.w;
   const wf = computeWaveform(data, aw, ah, {
@@ -168,7 +182,7 @@ function renderComposite(canvas, frame, frameW, frameH, W, analysisMax) {
     stopsRange: Number(settings.stopsRange),
   });
 
-  ctx.fillStyle = '#000';
+  ctx.fillStyle = '#0b0d0e';
   ctx.fillRect(0, 0, d.cw, d.ch);
   if (d.img) {
     ctx.imageSmoothingEnabled = true;
@@ -177,7 +191,8 @@ function renderComposite(canvas, frame, frameW, frameH, W, analysisMax) {
   }
   drawScope(ctx, wf, d.scope.x, d.scope.y, d.scope.w, d.scope.h, {
     gain: Number(settings.gain),
-    background: d.overlay ? 'rgba(0,0,0,0.42)' : '#0b0d0e',
+    background: d.overlay ? 'rgba(0,0,0,0.42)' : '#050606',
+    pad: d.pad,
     blackLight: luts.blackLight,
     unit: settings.scale,
     format: settings.format,
@@ -364,7 +379,11 @@ function autoDetect(frame, fw, fh, quiet = false) {
   try { r = detectOn(frame, fw, fh); } catch (err) { console.error(err); }
   if (r && r.ok) {
     setCrop(r.quad);
-    if (!quiet) toast(r.trimmed ? 'Picture found (black bars excluded)' : 'Picture edges found');
+    if (r.frame && luts.calibrated) {
+      toast('This looks like a frame grab, not a photo of the screen. Clear the calibration (Calibrate → Clear) to read its own code values.', 7000);
+    } else if (!quiet) {
+      toast(r.trimmed ? 'Picture found (black bars excluded)' : 'Picture edges found');
+    }
     return true;
   }
   if (!quiet || !crop) {
