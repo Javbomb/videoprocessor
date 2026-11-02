@@ -153,3 +153,20 @@ test('ADL is the mean light relative to peak, APL the mean signal', () => {
   assert.equal(sdr.apl, '50 IRE');
   assert.equal(sdr.adl, '25% (25 nits)');
 });
+
+test('low-pass filter keeps flat areas and removes noise', async () => {
+  const { lowPassRGBA, lowPassRadius } = await import('../js/waveform.js');
+  const w = 64, h = 48;
+  const d = new Uint8ClampedArray(w * h * 4);
+  let seed = 1;
+  const rnd = () => ((seed = (seed * 1103515245 + 12345) % 2147483648) / 2147483648);
+  for (let i = 0; i < d.length; i += 4) { d[i] = d[i + 1] = d[i + 2] = 120 + Math.round((rnd() - 0.5) * 40); d[i + 3] = 255; }
+  const sd = (a) => { let s = 0, s2 = 0, n = 0; for (let i = 0; i < a.length; i += 4) { s += a[i]; s2 += a[i] * a[i]; n++; } const m = s / n; return [m, Math.sqrt(s2 / n - m * m)]; };
+  const [m0, s0] = sd(d);
+  lowPassRGBA(d, w, h, 2);
+  const [m1, s1] = sd(d);
+  assert.ok(Math.abs(m1 - m0) < 1, 'mean preserved');
+  assert.ok(s1 < s0 / 4, `noise ${s0.toFixed(1)} -> ${s1.toFixed(1)}`);
+  assert.equal(lowPassRadius('off', 1280), 0);
+  assert.ok(lowPassRadius('high', 1280) > lowPassRadius('low', 1280));
+});

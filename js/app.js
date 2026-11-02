@@ -1,5 +1,5 @@
 import { FULL_QUAD, rectToQuad, isAxisAligned, quadBounds, quadAspect, warpQuad, detectPicture } from './geometry.js';
-import { buildLUTs, computeWaveform, drawScope, scopePadding, denoiseRGBA, statsLines, formatStats, measureRegion, axisFor, fmtNits, LUMA, TRANSFERS } from './waveform.js';
+import { buildLUTs, computeWaveform, drawScope, scopePadding, lowPassRGBA, lowPassRadius, statsLines, formatStats, measureRegion, axisFor, fmtNits, LUMA, TRANSFERS } from './waveform.js';
 
 // ---------------------------------------------------------------------------
 // Persistent state
@@ -20,9 +20,9 @@ const store = {
 };
 
 const DEFAULTS = {
-  mode: 'overlay', format: 'sdr', scale: 'percent', sdrPeak: 100, hdrPeak: 1000, stopsRange: 12, gain: 1.5,
+  mode: 'overlay', format: 'sdr', scale: 'percent', sdrPeak: 100, hdrPeak: 1000, stopsRange: 12, gain: 2.2,
   cameraTF: 'srgb', displayTF: 'g24', perChannel: true,
-  layout: 'stacked', burnStats: true, denoise: true, fileFormat: 'jpeg', cropOnLoad: 'detect', aspect: 'auto',
+  layout: 'stacked', burnStats: true, lowpass: 'high', fileFormat: 'jpeg', cropOnLoad: 'detect', aspect: 'auto',
 };
 const settings = { ...DEFAULTS, ...store.get('settings', {}) };
 if (settings.format !== 'sdr' && settings.format !== 'hdr') settings.format = 'sdr'; // older versions stored the file type here
@@ -170,7 +170,7 @@ function renderComposite(canvas, frame, frameW, frameH, W, analysisMax) {
   workCtx.imageSmoothingQuality = 'medium';
   workCtx.drawImage(pic.el, pic.sx, pic.sy, pic.sw, pic.sh, 0, 0, aw, ah);
   const data = workCtx.getImageData(0, 0, aw, ah).data;
-  if (settings.denoise) denoiseRGBA(data, aw, ah);
+  lowPassRGBA(data, aw, ah, lowPassRadius(settings.lowpass, aw));
 
   const panelW = settings.mode === 'parade' ? d.scope.w / 3 : d.scope.w;
   const wf = computeWaveform(data, aw, ah, {
