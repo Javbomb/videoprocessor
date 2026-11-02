@@ -1,0 +1,12 @@
+{
+  "name": "projector-waveform",
+  "version": "1.0.0",
+  "description": "Resolve-style waveform monitor for photos and videos of a projected image, calibrated to the projector's peak white.",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node serve.mjs",
+    "test": "node --test tests/*.test.mjs"
+  },
+  "engines": { "node": ">=18" }
+}

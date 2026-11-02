@@ -33,12 +33,24 @@ The scope measures what the camera recorded, so the photos matter:
 
 Without calibration, the scope shows the photo's own code values, the same as running Resolve on the JPEG.
 
-## Running / hosting
+## Running it on your computer
 
-The app is static files with no build step. The live camera and *Add to Home Screen* need **HTTPS**:
+There's no build step and nothing to install except [Node.js](https://nodejs.org) 18 or newer.
 
-- The included GitHub Actions workflow (`.github/workflows/waveform-app-pages.yml`) publishes this folder to GitHub Pages. In repository Settings → Pages, set *Source* to **GitHub Actions**.
-- Local testing: `cd waveform-app && python3 -m http.server 8000`, then open `http://localhost:8000`.
+```
+git clone <this repo>
+cd projector-waveform
+npm start
+```
+
+It prints two addresses:
+
+- `http://localhost:8000` opens it on the computer. Drag and drop photos or videos onto the page.
+- `http://<your-PC-IP>:8000` opens it on a phone on the same Wi-Fi, where **Open** browses the phone's gallery.
+
+The **live camera** and *Add to Home Screen* need HTTPS on a phone (browsers only allow the camera on `https://` or `localhost`). For those, use the GitHub Pages build: the workflow in `.github/workflows/pages.yml` tests and publishes `main`. In the repo's Settings → Pages, set *Source* to **GitHub Actions**.
+
+Tests: `npm test`
 
 ## Code
 
@@ -46,4 +58,5 @@ The app is static files with no build step. The live camera and *Add to Home Scr
 - `js/geometry.js` — picture detection, homography and perspective warp (no DOM; unit tested).
 - `samples/generate.py` — renders the sample photos: procedural content projected through a simulated projector (gamma 2.4, ~2000:1, hotspot) onto a keystoned screen in a room, then "photographed" (glare, vignetting, noise, sRGB, JPEG). `--content your.jpg` simulates your own image on the screen.
 - `js/app.js` — UI, gallery/video/camera sources, region picking, compositing, saving and recording.
-- `tests/` — `node --test waveform-app/tests/*.test.mjs`
+- `serve.mjs` — zero-dependency local web server (`npm start`).
+- `tests/` — `npm test`
