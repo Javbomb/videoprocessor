@@ -6,6 +6,10 @@ This allows advanced renderers to do things like 3D LUT, HDR tone mapping, scali
 
 _Capture cards cannot capture HDCP protected data, VideoProcessor can only process what can be captured._
 
+# Projector Waveform (phone app)
+
+[`waveform-app/`](waveform-app/) contains a phone web app that applies a DaVinci Resolve-style waveform monitor to photos and videos of a projected image, calibrated to the projector's peak white. See its [README](waveform-app/README.md).
+
 # Website
 
 You can find all the static details on [videoprocessor.org](http://videoprocessor.org)

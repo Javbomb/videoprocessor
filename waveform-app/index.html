@@ -1,0 +1,176 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#0b0d0e">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="Waveform">
+  <meta name="description" content="Waveform monitor for photos and videos of a projected image. Calibrate to peak white and see how much dynamic range is used.">
+  <title>Projector Waveform</title>
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="icon" href="icons/icon.svg" type="image/svg+xml">
+  <link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
+  <link rel="stylesheet" href="css/styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <h1>Waveform</h1>
+    <div class="actions">
+      <label class="btn primary" title="Open a photo or video from your gallery">
+        <input id="fileInput" type="file" accept="image/*,video/*" hidden>
+        Open
+      </label>
+      <button id="cameraBtn" class="btn" type="button" title="Live camera">Live</button>
+      <button id="saveBtn" class="btn" type="button" disabled>Save</button>
+      <button id="recordBtn" class="btn rec" type="button" hidden>Record</button>
+    </div>
+  </header>
+
+  <main>
+    <section class="stage-wrap">
+      <div id="stage" class="stage">
+        <canvas id="view"></canvas>
+        <div id="empty" class="empty">
+          <p class="lead">Open a photo or video of your projector screen, or use the live camera.</p>
+          <ol>
+            <li>Project a <b>100% white</b> frame and lock the camera's exposure so the white isn't clipped.</li>
+            <li>Open that shot and use <b>Calibrate → Set white</b> on the screen.</li>
+            <li>Open shots of your content taken at the same exposure. The waveform now reads 100% / 1023 at projector peak white.</li>
+          </ol>
+          <p><a href="patterns.html" target="_blank" rel="noopener">Test patterns</a> to put on the projector.</p>
+        </div>
+      </div>
+      <div id="pickBar" class="pickbar" hidden>
+        <span id="pickHint">Drag a box</span>
+        <span class="spacer"></span>
+        <button id="pickCancel" class="btn" type="button">Cancel</button>
+        <button id="pickOk" class="btn primary" type="button" disabled>Use region</button>
+      </div>
+      <div id="videoBar" class="videobar" hidden>
+        <button id="playBtn" class="btn icon" type="button" aria-label="Play">▶</button>
+        <input id="seek" type="range" min="0" max="1000" value="0" aria-label="Seek">
+        <span id="timeLabel" class="time">0:00</span>
+      </div>
+      <div id="stats" class="stats" aria-live="polite"></div>
+      <div id="toast" class="toast" role="status" hidden></div>
+    </section>
+
+    <nav class="tabs" role="tablist">
+      <button class="tab active" data-tab="scope" role="tab">Scope</button>
+      <button class="tab" data-tab="calibrate" role="tab">Calibrate</button>
+      <button class="tab" data-tab="crop" role="tab">Crop</button>
+      <button class="tab" data-tab="output" role="tab">Output</button>
+    </nav>
+
+    <section class="panel" data-panel="scope">
+      <div class="field">
+        <span class="label">Mode</span>
+        <div class="seg" data-setting="mode">
+          <button data-value="luma">Luma</button>
+          <button data-value="parade">Parade</button>
+          <button data-value="overlay">RGB</button>
+        </div>
+      </div>
+      <div class="field">
+        <span class="label">Scale</span>
+        <div class="seg" data-setting="scale">
+          <button data-value="code">10-bit</button>
+          <button data-value="percent">%</button>
+          <button data-value="stops">Stops</button>
+        </div>
+      </div>
+      <div class="field" data-show-when="scale=stops">
+        <label class="label" for="stopsRange">Stops shown</label>
+        <select id="stopsRange" data-setting="stopsRange">
+          <option value="8">8</option>
+          <option value="10">10</option>
+          <option value="12">12</option>
+          <option value="14">14</option>
+          <option value="16">16</option>
+        </select>
+      </div>
+      <div class="field">
+        <label class="label" for="gain">Brightness</label>
+        <input id="gain" type="range" min="0.2" max="8" step="0.1" data-setting="gain">
+      </div>
+    </section>
+
+    <section class="panel" data-panel="calibrate" hidden>
+      <div id="calStatus" class="calstatus"></div>
+      <div class="row">
+        <button id="setWhite" class="btn primary" type="button" disabled>Set white</button>
+        <button id="setBlack" class="btn" type="button" disabled>Set black</button>
+        <button id="clearCal" class="btn ghost" type="button">Clear</button>
+      </div>
+      <p class="hint">Drag a box over the screen while it shows 100% white (or 0% black). It is stored on this phone and used for every photo and video afterwards, so keep the same exposure.</p>
+      <div class="field">
+        <label class="label" for="cameraTF">Camera encoding</label>
+        <select id="cameraTF" data-setting="cameraTF">
+          <option value="srgb">sRGB (phone photo)</option>
+          <option value="g22">Gamma 2.2</option>
+          <option value="g24">Gamma 2.4</option>
+          <option value="linear">Linear</option>
+        </select>
+      </div>
+      <div class="field">
+        <label class="label" for="displayTF">Projector gamma</label>
+        <select id="displayTF" data-setting="displayTF">
+          <option value="g22">2.2</option>
+          <option value="g24">2.4 (BT.1886)</option>
+          <option value="g26">2.6 (DCI)</option>
+          <option value="srgb">sRGB</option>
+          <option value="linear">Linear (show light)</option>
+        </select>
+      </div>
+      <label class="check"><input type="checkbox" data-setting="perChannel"> Per-channel white (neutralise the camera's white balance)</label>
+      <div id="camControls" class="camcontrols" hidden>
+        <span class="label">Live camera</span>
+        <div class="row">
+          <button id="lockExp" class="btn" type="button">Lock exposure &amp; WB</button>
+        </div>
+        <div class="field" id="evField" hidden>
+          <label class="label" for="ev">Exposure comp.</label>
+          <input id="ev" type="range">
+        </div>
+      </div>
+    </section>
+
+    <section class="panel" data-panel="crop" hidden>
+      <p class="hint">Crop to the projected picture so each scope column lines up with the picture.</p>
+      <div class="row">
+        <button id="setCrop" class="btn primary" type="button" disabled>Select picture area</button>
+        <button id="clearCrop" class="btn ghost" type="button">Reset</button>
+      </div>
+      <label class="check"><input type="checkbox" data-setting="keepCrop"> Keep crop for the next files (tripod)</label>
+    </section>
+
+    <section class="panel" data-panel="output" hidden>
+      <div class="field">
+        <span class="label">Layout</span>
+        <div class="seg wrap" data-setting="layout">
+          <button data-value="stacked">Top / bottom</button>
+          <button data-value="side">Side by side</button>
+          <button data-value="overlay">Overlay</button>
+          <button data-value="scope">Scope only</button>
+        </div>
+      </div>
+      <label class="check"><input type="checkbox" data-setting="burnStats"> Write stats onto the saved image</label>
+      <div class="field">
+        <span class="label">Save as</span>
+        <div class="seg" data-setting="format">
+          <button data-value="jpeg">JPEG</button>
+          <button data-value="png">PNG</button>
+        </div>
+      </div>
+      <p class="hint">Save renders at full quality. With a video or the live camera, Record makes a new video with the scope composed in.</p>
+    </section>
+  </main>
+
+  <video id="video" playsinline muted hidden></video>
+
+  <script type="module" src="js/app.js"></script>
+</body>
+</html>
