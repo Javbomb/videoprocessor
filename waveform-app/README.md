@@ -7,8 +7,11 @@ It runs on iPhone and Android with no app store. Open the page and choose *Add t
 ## What it does
 
 - **Open** a photo or video from the gallery (or take one: the phone's picker offers the camera), or use **Live** for the camera feed.
-- **Scopes:** Luma (Y′, Rec.709), RGB Parade, RGB Overlay.
-- **Scales:** 10-bit code values (0–1023, like Resolve), percent, or **stops** below peak white (light, log scale).
+- **Scopes:** RGB overlay (the default: R, G and B traces drawn on top of each other), RGB Parade, and Luma (Y′, Rec.709).
+- **SDR or HDR:** the vertical axis always runs from **0 at the bottom to peak white at the top**. You enter the peak white in nits, with presets (SDR 48/100/150/200, HDR 600/1k/4k/10k) or any value up to 10,000.
+  - **SDR:** gamma-encoded signal. The legend can be **IRE** (0–100), **nits** (placed through the SDR gamma), or **10-bit** codes (0–1023).
+  - **HDR (PQ, SMPTE ST 2084):** a PQ-spaced axis like Resolve's HDR scopes, topped at the chosen peak. The legend can be **nits**, **% of peak** light, or **PQ code values** (e.g. 1,000 nits = 769).
+  - **Stops:** for either signal type, a log scale of light below peak white.
 - **Calibrate:** *Set white* on a shot of a 100% white frame. *Set black* on a 0% black frame (optional). After that, 1023 / 100% is the projector's peak white, and the stops scale shows the measured black floor as a dashed blue line. The app also reports the projector's contrast as the camera saw it. Calibration is saved on the phone.
 - **Crop** to the projected picture so the scope's columns line up with the image. Turn on "keep crop" if you shoot from a tripod.
 - **Output:** save a new JPEG/PNG as **top/bottom**, **side-by-side**, **overlay** (scope over the lower part of the image) or **scope only**, with optional burned-in stats. For videos and the live camera, **Record** makes a new video with the scope composed in.
@@ -22,7 +25,7 @@ The scope measures what the camera recorded, so the photos matter:
 1. **Lock the exposure** (iPhone: long-press to set AE/AF Lock. Android: Pro/Manual mode). Shoot the white frame and your content at the **same exposure**, and keep it there for the whole session.
 2. Expose so the white frame is **not clipped**: it should be bright but under 255. The app warns you when the white sample is clipped.
 3. Turn off HDR, Smart HDR and Night mode for photos, and turn off **HDR video** (iPhone: Settings → Camera → Record Video → HDR Video) for videos.
-4. Set *Projector gamma* to match the projector (2.2 or 2.4 are typical). The signal estimate inverts `L = black + (white − black) · signal^γ`.
+4. In SDR, set *SDR gamma* (Calibrate tab) to match the projector; 2.2 or 2.4 are typical. The IRE estimate inverts `L = black + (white − black) · signal^γ`. In HDR, the light measured relative to the calibrated white is scaled to the peak you enter (white patch = peak nits) and then PQ-encoded.
 5. Phone cameras apply their own tone curve, so treat the readings as a good estimate rather than lab measurements. The *Stops* scale is the most robust view of "how much of the range is used".
 
 Without calibration, the scope shows the photo's own code values, the same as running Resolve on the JPEG.

@@ -1,5 +1,5 @@
 // Offline cache for the app shell. Bump VERSION when files change.
-const VERSION = 'wfm-v1';
+const VERSION = 'wfm-v2';
 const SHELL = [
   './',
   'index.html',

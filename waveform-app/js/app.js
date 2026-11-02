@@ -1,4 +1,4 @@
-import { buildLUTs, computeWaveform, drawScope, statsLines, measureRegion, formatValue, LUMA } from './waveform.js';
+import { buildLUTs, computeWaveform, drawScope, statsLines, formatStats, measureRegion, axisFor, fmtNits, LUMA, TRANSFERS } from './waveform.js';
 
 // ---------------------------------------------------------------------------
 // Persistent state
@@ -19,11 +19,12 @@ const store = {
 };
 
 const DEFAULTS = {
-  mode: 'luma', scale: 'code', stopsRange: 12, gain: 1.5,
+  mode: 'overlay', format: 'sdr', scale: 'percent', sdrPeak: 100, hdrPeak: 1000, stopsRange: 12, gain: 1.5,
   cameraTF: 'srgb', displayTF: 'g24', perChannel: true,
-  layout: 'stacked', burnStats: true, format: 'jpeg', keepCrop: false,
+  layout: 'stacked', burnStats: true, fileFormat: 'jpeg', keepCrop: false,
 };
 const settings = { ...DEFAULTS, ...store.get('settings', {}) };
+if (settings.format !== 'sdr' && settings.format !== 'hdr') settings.format = 'sdr'; // older versions stored the file type here
 let calibration = store.get('calibration', { white: null, black: null });
 let crop = settings.keepCrop ? store.get('crop', null) : null; // normalized {x,y,w,h}
 let luts = rebuildLUTs();
@@ -104,7 +105,7 @@ function renderComposite(canvas, frame, frameW, frameH, W, analysisMax) {
   const panelW = settings.mode === 'parade' ? d.scope.w / 3 : d.scope.w;
   const wf = computeWaveform(data, aw, ah, {
     mode: settings.mode,
-    scale: settings.scale,
+    axis: axisFor(settings.format, settings.scale),
     columns: Math.min(Math.round(panelW), aw),
     rows: d.scope.h,
     luts,
@@ -122,7 +123,12 @@ function renderComposite(canvas, frame, frameW, frameH, W, analysisMax) {
     gain: Number(settings.gain),
     background: d.overlay ? 'rgba(0,0,0,0.55)' : '#0b0d0e',
     blackLight: luts.blackLight,
-    statsText: settings.burnStats ? statsLines(wf.stats, settings.scale, luts.calibrated) : '',
+    unit: settings.scale,
+    format: settings.format,
+    peakNits: peakNits(),
+    displayTF: settings.displayTF,
+    caption: scopeCaption(),
+    statsText: settings.burnStats ? statsLines(wf.stats, statsOpts()) : '',
   });
   return wf.stats;
 }
@@ -192,12 +198,11 @@ function startLoop() {
 // ---------------------------------------------------------------------------
 
 function showStats(s) {
-  const sc = settings.scale === 'stops' ? 'percent' : settings.scale;
-  const f = (v) => formatValue(sc, v);
+  const f = formatStats(s, statsOpts());
   const parts = [
-    `<b>Peak</b> ${f(s.peak)}`,
-    `<b>Floor</b> ${f(s.floor)}`,
-    `<b>Mean</b> ${f(s.mean)}`,
+    `<b>Peak</b> ${f.peak}`,
+    `<b>Floor</b> ${f.floor}`,
+    `<b>Mean</b> ${f.mean}`,
     `<b>Range</b> ${s.rangeStops.toFixed(1)} stops`,
   ];
   if (luts.calibrated) parts.push(`<b>Peak</b> ${s.peakStops.toFixed(1)} st from white`);
@@ -226,8 +231,27 @@ function showCalibration() {
   $('calStatus').innerHTML = `<dl class="calstatus" style="display:contents">${html}</dl>`;
 }
 
+function peakNits() {
+  const v = Number(settings.format === 'hdr' ? settings.hdrPeak : settings.sdrPeak);
+  return Math.min(10000, Math.max(1, v || (settings.format === 'hdr' ? 1000 : 100)));
+}
+
+function statsOpts() {
+  return { format: settings.format, unit: settings.scale, peakNits: peakNits(), calibrated: luts.calibrated };
+}
+
+function scopeCaption() {
+  const peak = `${fmtNits(peakNits())} nits peak`;
+  if (settings.format === 'hdr') return `HDR PQ · ${peak}`;
+  const g = (TRANSFERS[settings.displayTF]?.label || '').replace(/ \(.*\)/, '').replace('Gamma ', 'γ');
+  return `SDR ${g} · ${peak}`;
+}
+
+const PEAK_PRESETS = { sdr: [48, 100, 150, 200], hdr: [600, 1000, 4000, 10000] };
+
 function rebuildLUTs() {
   return buildLUTs({
+    peakNits: peakNits(),
     cameraTF: settings.cameraTF,
     displayTF: settings.displayTF,
     perChannel: settings.perChannel,
@@ -559,11 +583,11 @@ async function saveImage() {
   const W = Math.min(maxW, Math.max(1280, sw));
   const out = document.createElement('canvas');
   renderComposite(out, source.el, source.w, source.h, W, 2048);
-  const type = settings.format === 'png' ? 'image/png' : 'image/jpeg';
+  const type = settings.fileFormat === 'png' ? 'image/png' : 'image/jpeg';
   const blob = await new Promise((r) => out.toBlob(r, type, 0.93));
   if (!blob) return toast('Could not create the image.');
   const suffix = source.kind === 'video' ? `_${video.currentTime.toFixed(2)}s` : '';
-  await deliverFile(new File([blob], `${source.name}${suffix}_waveform.${settings.format === 'png' ? 'png' : 'jpg'}`, { type }));
+  await deliverFile(new File([blob], `${source.name}${suffix}_waveform.${settings.fileFormat === 'png' ? 'png' : 'jpg'}`, { type }));
 }
 
 function pickMime() {
@@ -672,7 +696,7 @@ function setSetting(key, value) {
   if (key === 'layout' && recorder) return toast('Stop recording to change the layout.');
   settings[key] = value;
   store.set('settings', settings);
-  if (['cameraTF', 'displayTF', 'perChannel'].includes(key)) {
+  if (['cameraTF', 'displayTF', 'perChannel', 'format', 'sdrPeak', 'hdrPeak'].includes(key)) {
     luts = rebuildLUTs();
     showCalibration();
   }
@@ -692,6 +716,18 @@ function syncUI() {
   document.querySelectorAll('input[type=checkbox][data-setting]').forEach((el) => {
     el.checked = !!settings[el.dataset.setting];
   });
+  // Format-dependent legend labels and peak presets
+  const hdr = settings.format === 'hdr';
+  const pctBtn = document.querySelector('.seg[data-setting=scale] button[data-value=percent]');
+  if (pctBtn) pctBtn.textContent = hdr ? '% peak' : 'IRE';
+  const codeBtn = document.querySelector('.seg[data-setting=scale] button[data-value=code]');
+  if (codeBtn) codeBtn.textContent = hdr ? 'PQ code' : '10-bit';
+  const peakKey = hdr ? 'hdrPeak' : 'sdrPeak';
+  const peakIn = $('peakNits');
+  if (document.activeElement !== peakIn) peakIn.value = settings[peakKey];
+  const presets = $('peakPresets');
+  presets.innerHTML = PEAK_PRESETS[settings.format].map((n) =>
+    `<button data-value="${n}" class="${Number(settings[peakKey]) === n ? 'on' : ''}">${n >= 1000 ? n / 1000 + 'k' : n}</button>`).join('');
   document.querySelectorAll('[data-show-when]').forEach((el) => {
     const [k, v] = el.dataset.showWhen.split('=');
     el.hidden = String(settings[k]) !== v;
@@ -713,6 +749,15 @@ function bindUI() {
   });
   document.querySelectorAll('input[type=checkbox][data-setting]').forEach((el) => {
     el.addEventListener('change', () => setSetting(el.dataset.setting, el.checked));
+  });
+
+  $('peakNits').addEventListener('change', (e) => {
+    const v = Math.min(10000, Math.max(1, Number(e.target.value) || 0));
+    if (v) setSetting(settings.format === 'hdr' ? 'hdrPeak' : 'sdrPeak', v);
+  });
+  $('peakPresets').addEventListener('click', (e) => {
+    const b = e.target.closest('button');
+    if (b) setSetting(settings.format === 'hdr' ? 'hdrPeak' : 'sdrPeak', Number(b.dataset.value));
   });
 
   document.querySelectorAll('.tab').forEach((tab) => {

@@ -1,7 +1,7 @@
 // Run with: node --test waveform-app/tests
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { TRANSFERS, buildLUTs, computeWaveform, measureRegion, scaleRange } from '../js/waveform.js';
+import { TRANSFERS, buildLUTs, computeWaveform, measureRegion, scaleRange, pqEncode, pqDecode, graticule, formatStats, axisFor } from '../js/waveform.js';
 
 const solid = (w, h, r, g, b) => {
   const d = new Uint8ClampedArray(w * h * 4);
@@ -58,9 +58,9 @@ test('measureRegion reports camera clipping', () => {
 test('flat field lands in a single waveform row per column', () => {
   const w = 64, h = 32;
   const luts = buildLUTs();
-  const wf = computeWaveform(solid(w, h, 128, 128, 128), w, h, { mode: 'luma', scale: 'code', columns: 32, rows: 100, luts });
+  const wf = computeWaveform(solid(w, h, 128, 128, 128), w, h, { mode: 'luma', axis: 'sdr', columns: 32, rows: 100, luts });
   const b = wf.bins[0];
-  const { lo, hi } = scaleRange('code');
+  const { lo, hi } = scaleRange('sdr');
   const expectedRow = Math.round((hi - 128 / 255) * (99 / (hi - lo)));
   for (let col = 0; col < 32; col++) {
     assert.equal(b[expectedRow * 32 + col], h * 2, `col ${col}`);
@@ -76,7 +76,7 @@ test('horizontal ramp produces a diagonal and full-range stats', () => {
     const i = (y * w + x) * 4;
     d[i] = d[i + 1] = d[i + 2] = x; d[i + 3] = 255;
   }
-  const wf = computeWaveform(d, w, h, { mode: 'parade', scale: 'percent', columns: 256, rows: 256, luts: buildLUTs() });
+  const wf = computeWaveform(d, w, h, { mode: 'parade', axis: 'sdr', columns: 256, rows: 256, luts: buildLUTs() });
   assert.equal(wf.bins.length, 3);
   // Each column's samples live in exactly one row; row decreases as x increases.
   const rowOf = (col) => { for (let r = 0; r < 256; r++) if (wf.bins[1][r * 256 + col]) return r; return -1; };
@@ -87,7 +87,59 @@ test('horizontal ramp produces a diagonal and full-range stats', () => {
 test('stops scale accumulates without overflow', () => {
   const white = measureRegion(solid(4, 4, 240, 240, 240));
   const luts = buildLUTs({ white });
-  const wf = computeWaveform(solid(16, 16, 0, 0, 0), 16, 16, { mode: 'luma', scale: 'stops', columns: 16, rows: 50, luts, stopsRange: 10 });
+  const wf = computeWaveform(solid(16, 16, 0, 0, 0), 16, 16, { mode: 'luma', axis: 'stops', columns: 16, rows: 50, luts, stopsRange: 10 });
   const total = wf.bins[0].reduce((a, b) => a + b, 0);
   assert.equal(total, 256);
+});
+
+test('PQ matches ST 2084 reference points', () => {
+  assert.ok(Math.abs(pqEncode(10000) - 1) < 1e-9);
+  assert.ok(Math.abs(pqEncode(100) - 0.5081) < 1e-3);
+  assert.ok(Math.abs(pqEncode(1000) - 0.7518) < 1e-3);
+  assert.equal(pqEncode(0), 0);
+  for (const n of [0.05, 1, 100, 1000, 4000]) assert.ok(Math.abs(pqDecode(pqEncode(n)) - n) / n < 1e-6);
+});
+
+test('HDR: reference white sits at the top of the PQ axis, half light lower', () => {
+  const white = measureRegion(solid(4, 4, 255, 255, 255));
+  const luts = buildLUTs({ white, cameraTF: 'linear', peakNits: 1000 });
+  assert.ok(Math.abs(luts.pqFine[0][1023] - 1) < 1e-4);
+  // 128/255 linear ~ 502 nits -> PQ(502)/PQ(1000)
+  const mid = luts.pqFine[1][128 * 4 + 1];
+  assert.ok(Math.abs(mid - pqEncode(1000 * 128 / 255) / pqEncode(1000)) < 0.01);
+  const wf = computeWaveform(solid(8, 8, 255, 255, 255), 8, 8, { mode: 'overlay', axis: 'pq', columns: 8, rows: 111, luts });
+  const { lo, hi } = scaleRange('pq');
+  const topRow = Math.round((hi - 1) * (110 / (hi - lo)));
+  assert.equal(wf.bins[0][topRow * 8], 8);
+});
+
+test('legends: top line is the chosen peak', () => {
+  const hdr = graticule('pq', 'nits', { peakNits: 1000 });
+  const top = hdr[hdr.length - 1];
+  assert.equal(top.value, 1);
+  assert.equal(top.label, '1000 nits');
+  assert.ok(hdr.some((l) => l.label === '100'));
+  assert.equal(graticule('pq', 'nits', { peakNits: 10000 }).at(-1).label, '10000 nits');
+  const pqCode = graticule('pq', 'code', { peakNits: 1000 }).at(-1);
+  assert.equal(pqCode.label, '769 (PQ)');
+  const ire = graticule('sdr', 'percent', {});
+  assert.equal(ire.at(-1).label, '100 IRE');
+  const sdrNits = graticule('sdr', 'nits', { peakNits: 100, displayTF: 'g24' });
+  assert.equal(sdrNits.at(-1).label, '100 nits');
+  // values strictly increase bottom-up
+  for (const g of [hdr, sdrNits, pqCode && graticule('pq', 'code', { peakNits: 1000 })]) {
+    for (let i = 1; i < g.length; i++) assert.ok(g[i].value > g[i - 1].value);
+  }
+  assert.equal(axisFor('hdr', 'nits'), 'pq');
+  assert.equal(axisFor('sdr', 'nits'), 'sdr');
+  assert.equal(axisFor('hdr', 'stops'), 'stops');
+});
+
+test('stats are reported in the selected unit', () => {
+  const s = { peak: 0.9, floor: 0.1, mean: 0.5, meanLight: 0.25, peakStops: -1, floorStops: -8, rangeStops: 7 };
+  assert.equal(formatStats(s, { format: 'hdr', unit: 'nits', peakNits: 1000 }).peak, '500 nits');
+  assert.equal(formatStats(s, { format: 'hdr', unit: 'percent', peakNits: 1000 }).peak, '50%');
+  assert.equal(formatStats(s, { format: 'sdr', unit: 'percent', peakNits: 100 }).peak, '90 IRE');
+  assert.equal(formatStats(s, { format: 'sdr', unit: 'code', peakNits: 100 }).peak, '921');
+  assert.equal(formatStats(s, { format: 'sdr', unit: 'nits', peakNits: 100 }).mean, '25 nits');
 });
