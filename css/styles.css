@@ -176,6 +176,20 @@ main { max-width: 1100px; margin: 0 auto; }
 .field[hidden] { display: none; }
 .label { min-width: 96px; color: var(--muted); font-size: 14px; }
 .field input[type="range"] { flex: 1; min-width: 140px; }
+.peak { display: flex; flex: 1; gap: 8px; align-items: center; flex-wrap: wrap; min-width: 0; }
+.peak input {
+  width: 92px;
+  min-height: 36px;
+  padding: 0 10px;
+  border-radius: 9px;
+  border: 1px solid var(--line);
+  background: var(--panel-2);
+  color: var(--text);
+  font: inherit;
+  font-variant-numeric: tabular-nums;
+}
+.peak .unit { color: var(--muted); font-size: 14px; }
+.seg.presets { flex: 1 1 180px; }
 
 select {
   flex: 1;

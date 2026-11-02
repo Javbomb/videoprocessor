@@ -23,6 +23,23 @@ export const TRANSFERS = {
 // Rec.709 luma weights (as used by DaVinci Resolve's Y waveform).
 export const LUMA = [0.2126, 0.7152, 0.0722];
 
+// SMPTE ST 2084 (PQ). Absolute: 1.0 = 10,000 nits.
+const PQ_M1 = 2610 / 16384, PQ_M2 = (2523 / 4096) * 128;
+const PQ_C1 = 3424 / 4096, PQ_C2 = (2413 / 4096) * 32, PQ_C3 = (2392 / 4096) * 32;
+
+/** nits -> PQ signal (0..1) */
+export function pqEncode(nits) {
+  if (!(nits > 0)) return 0;
+  const p = Math.pow(Math.min(Math.max(nits, 0), 10000) / 10000, PQ_M1);
+  return Math.pow((PQ_C1 + PQ_C2 * p) / (1 + PQ_C3 * p), PQ_M2);
+}
+
+/** PQ signal (0..1) -> nits */
+export function pqDecode(e) {
+  const p = Math.pow(Math.min(Math.max(e, 0), 1), 1 / PQ_M2);
+  return 10000 * Math.pow(Math.max(p - PQ_C1, 0) / (PQ_C2 - PQ_C3 * p), 1 / PQ_M1);
+}
+
 // ---------------------------------------------------------------------------
 // Calibration
 // ---------------------------------------------------------------------------
@@ -60,10 +77,11 @@ export function measureRegion(data) {
 
 /**
  * Build per-channel lookup tables from 8-bit camera code value to
- *  - sig:   estimated *signal* level that was sent to the projector (0..1 = black..reference white)
- *  - light: linear screen light relative to reference white (1.0 = white), for the stops scale
+ *  - sig:   estimated SDR *signal* sent to the projector (0..1 = black..reference white)
+ *  - light: linear screen light relative to reference white (1.0 = peak white)
+ *  - pqFine: HDR axis position, PQ(light * peakNits) / PQ(peakNits)  (0..1 = 0 nits..peak)
  */
-export function buildLUTs({ cameraTF = 'srgb', displayTF = 'g24', perChannel = true, white = null, black = null } = {}) {
+export function buildLUTs({ cameraTF = 'srgb', displayTF = 'g24', perChannel = true, white = null, black = null, peakNits = 1000 } = {}) {
   const cam = TRANSFERS[cameraTF] || TRANSFERS.srgb;
   const disp = TRANSFERS[displayTF] || TRANSFERS.g24;
   const sig = [new Float32Array(256), new Float32Array(256), new Float32Array(256)];
@@ -85,7 +103,7 @@ export function buildLUTs({ cameraTF = 'srgb', displayTF = 'g24', perChannel = t
     for (let v = 0; v < 256; v++) {
       const l = cam.toLinear(v / 255);
       if (!w) {
-        // Uncalibrated: show the photo's own code values.
+        // Uncalibrated: show the photo's own code values; camera clip = peak.
         sig[c][v] = v / 255;
         light[c][v] = l;
       } else {
@@ -93,8 +111,7 @@ export function buildLUTs({ cameraTF = 'srgb', displayTF = 'g24', perChannel = t
         const bc = b ? Math.min(b[c], wc * 0.999) : 0;
         light[c][v] = l / wc;
         // Invert a simple display model: L = black + (white - black) * signal^gamma
-        const n = (l - bc) / (wc - bc);
-        sig[c][v] = disp.fromLinear(n);
+        sig[c][v] = disp.fromLinear((l - bc) / (wc - bc));
       }
     }
   }
@@ -111,40 +128,132 @@ export function buildLUTs({ cameraTF = 'srgb', displayTF = 'g24', perChannel = t
   });
   const sigFine = fine(sig);
   const lightFine = fine(light);
+  const pqPeak = pqEncode(peakNits);
+  const pqFine = lightFine.map((t) => t.map((l) => pqEncode(l * peakNits) / pqPeak));
   const blackLight = w && b ? (LUMA[0] * b[0] + LUMA[1] * b[1] + LUMA[2] * b[2]) /
     (LUMA[0] * w[0] + LUMA[1] * w[1] + LUMA[2] * w[2]) : null;
-  return { sig, light, sigFine, lightFine, calibrated: !!w, blackLight };
+  return { sig, light, sigFine, lightFine, pqFine, peakNits, calibrated: !!w, blackLight };
 }
 
 // ---------------------------------------------------------------------------
-// Scales
+// Axes and legends
 // ---------------------------------------------------------------------------
+//
+// The vertical axis always runs from 0 (black / 0 nits) at the bottom to 1
+// (calibrated peak white) at the top, with a little headroom above.
+//   'sdr'   : gamma-encoded SDR signal (IRE)
+//   'pq'    : PQ-encoded, normalised so peak white = 1 (HDR)
+//   'stops' : log2 of light relative to peak white
 
-/** Vertical range of the plot for a scale. Values outside are clamped to the edge rows. */
-export function scaleRange(scale, stopsRange = 10) {
-  if (scale === 'stops') return { lo: -stopsRange - 0.25, hi: 0.75 };
+/** Which axis a format + unit selection uses. */
+export function axisFor(format, unit) {
+  if (unit === 'stops') return 'stops';
+  return format === 'hdr' ? 'pq' : 'sdr';
+}
+
+/** Vertical range of the plot for an axis. Values outside are clamped to the edge rows. */
+export function scaleRange(axis, stopsRange = 10) {
+  if (axis === 'stops') return { lo: -stopsRange - 0.25, hi: 0.75 };
   return { lo: -0.03, hi: 1.07 };
 }
 
-/** Graticule lines: [{value, label, major}] in the scale's own units. */
-export function graticule(scale, stopsRange = 10) {
+/** Axis position of a light level given as a fraction of peak white. */
+export function lightToAxis(rel, axis, { peakNits = 100, displayTF = 'g24' } = {}) {
+  if (axis === 'stops') return rel > 1e-9 ? Math.log2(rel) : -99;
+  if (axis === 'pq') return pqEncode(rel * peakNits) / pqEncode(peakNits);
+  return (TRANSFERS[displayTF] || TRANSFERS.g24).fromLinear(rel);
+}
+
+const NITS_STEPS = [0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 4000, 10000];
+const PCT_STEPS = [0.1, 0.5, 1, 2, 5, 10, 20, 50];
+const isDecade = (n) => Math.abs(Math.log10(n) - Math.round(Math.log10(n))) < 1e-9;
+
+export function fmtNits(n) {
+  if (n >= 100) return String(Math.round(n));
+  if (n >= 10) return n.toFixed(0);
+  if (n >= 1) return n.toFixed(1).replace(/\.0$/, '');
+  return n.toFixed(n >= 0.1 ? 2 : 3).replace(/0+$/, '').replace(/\.$/, '');
+}
+
+/**
+ * Graticule lines [{value, label, major}] with value in axis units.
+ * unit: 'percent' (IRE for SDR, % of peak light for HDR) | 'nits' | 'code' | 'stops'
+ */
+export function graticule(axis, unit, o = {}) {
+  const { peakNits = 100, stopsRange = 10 } = o;
   const lines = [];
-  if (scale === 'code') {
-    for (let i = 0; i <= 8; i++) {
-      const cv = i === 8 ? 1023 : i * 128;
-      lines.push({ value: cv / 1023, label: String(cv), major: i % 2 === 0 });
+  const MIN_GAP = 0.045;
+  // Add lines bottom-up, skipping ones that would crowd their neighbour or the top line.
+  const ladder = (items) => {
+    let last = 0;
+    lines.push({ value: 0, label: '0', major: true });
+    for (const it of items) {
+      if (it.value - last >= MIN_GAP && 1 - it.value >= MIN_GAP) {
+        lines.push(it);
+        last = it.value;
+      }
     }
-  } else if (scale === 'percent') {
-    for (let p = 0; p <= 100; p += 10) lines.push({ value: p / 100, label: p + '%', major: p % 50 === 0 });
+  };
+
+  if (axis === 'stops') {
+    for (let s = 0; s >= -stopsRange; s--) {
+      const label = s === 0 ? `0 st = ${fmtNits(peakNits)} nits` : String(s);
+      lines.push({ value: s, label, major: s % 2 === 0 });
+    }
+  } else if (unit === 'nits') {
+    ladder(NITS_STEPS.filter((n) => n < peakNits * 0.999)
+      .map((n) => ({ value: lightToAxis(n / peakNits, axis, o), label: fmtNits(n), major: isDecade(n) })));
+    lines.push({ value: 1, label: `${fmtNits(peakNits)} nits`, major: true });
+  } else if (unit === 'code') {
+    if (axis === 'pq') {
+      const top = pqEncode(peakNits);
+      const topCode = Math.round(top * 1023);
+      const items = [];
+      for (let cv = 64; cv < topCode; cv += 64) items.push({ value: cv / 1023 / top, label: String(cv), major: cv % 256 === 0 });
+      ladder(items);
+      lines.push({ value: 1, label: `${topCode} (PQ)`, major: true });
+    } else {
+      for (let i = 0; i <= 8; i++) {
+        const cv = i === 8 ? 1023 : i * 128;
+        lines.push({ value: cv / 1023, label: String(cv), major: i % 2 === 0 });
+      }
+    }
+  } else if (axis === 'pq') {
+    // % of peak light, PQ spaced
+    ladder(PCT_STEPS.map((p) => ({ value: lightToAxis(p / 100, axis, o), label: p + '%', major: isDecade(p) })));
+    lines.push({ value: 1, label: '100%', major: true });
   } else {
-    for (let s = 0; s >= -stopsRange; s--) lines.push({ value: s, label: s === 0 ? '0 st' : String(s), major: s % 2 === 0 });
+    for (let p = 0; p <= 100; p += 10) lines.push({ value: p / 100, label: p === 100 ? '100 IRE' : String(p), major: p % 50 === 0 });
   }
   return lines;
 }
 
-export function formatValue(scale, v) {
-  if (scale === 'code') return String(Math.round(v * 1023));
-  return (v * 100).toFixed(v < 0.1 ? 1 : 0) + '%';
+/**
+ * Format the peak / floor / mean statistics for display.
+ * o: {format: 'sdr'|'hdr', unit, peakNits}
+ */
+export function formatStats(stats, o) {
+  const { format = 'sdr', unit = 'percent', peakNits = 100 } = o;
+  const nits = { peak: peakNits * 2 ** stats.peakStops, floor: peakNits * 2 ** stats.floorStops, mean: peakNits * stats.meanLight };
+  const each = (fn) => ({ peak: fn('peak'), floor: fn('floor'), mean: fn('mean') });
+  if (unit === 'nits' || (unit === 'stops' && format === 'hdr')) return each((k) => fmtNits(nits[k]) + ' nits');
+  if (format === 'sdr' && unit === 'code') return each((k) => String(Math.round(stats[k] * 1023)));
+  if (format === 'sdr') return each((k) => (stats[k] * 100).toFixed(0) + ' IRE');
+  if (unit === 'code') return each((k) => String(Math.round(pqEncode(nits[k]) * 1023)));
+  return each((k) => {
+    const p = (nits[k] / peakNits) * 100;
+    return (p < 10 ? p.toFixed(1) : p.toFixed(0)) + '%';
+  });
+}
+
+/** Two short lines of stats to burn into the scope. */
+export function statsLines(stats, o) {
+  const f = formatStats(stats, o);
+  const cal = o.calibrated ? '' : ' (uncalibrated)';
+  return [
+    `Peak ${f.peak}  Floor ${f.floor}  Mean ${f.mean}`,
+    `Light ${stats.rangeStops.toFixed(1)} stops, peak ${stats.peakStops.toFixed(1)} st${cal}`,
+  ];
 }
 
 // ---------------------------------------------------------------------------
@@ -160,18 +269,18 @@ const STOP_LO = -20, STOP_HI = 4;
  * @param {Uint8ClampedArray} data RGBA pixels
  * @param {number} width
  * @param {number} height
- * @param {object} opts {mode: 'luma'|'parade'|'overlay', scale: 'code'|'percent'|'stops',
+ * @param {object} opts {mode: 'luma'|'parade'|'overlay', axis: 'sdr'|'pq'|'stops',
  *                       columns, rows, luts, stopsRange}
  */
 export function computeWaveform(data, width, height, opts) {
-  const { mode = 'luma', scale = 'code', luts, stopsRange = 10 } = opts;
+  const { mode = 'overlay', axis = 'sdr', luts, stopsRange = 10 } = opts;
   const columns = Math.max(1, opts.columns | 0);
   const rows = Math.max(2, opts.rows | 0);
-  const { lo, hi } = scaleRange(scale, stopsRange);
+  const { lo, hi } = scaleRange(axis, stopsRange);
   const rowScale = (rows - 1) / (hi - lo);
-  const stops = scale === 'stops';
+  const stops = axis === 'stops';
   const toRow = (v) => {
-    let r = Math.round((hi - v) * rowScale);
+    const r = Math.round((hi - v) * rowScale);
     return r < 0 ? 0 : r >= rows ? rows - 1 : r;
   };
   const toRowStops = (l) => toRow(l > 1e-9 ? Math.log2(l) : -99);
@@ -183,13 +292,14 @@ export function computeWaveform(data, width, height, opts) {
   const colMap = new Int32Array(width);
   for (let x = 0; x < width; x++) colMap[x] = Math.min(columns - 1, Math.floor((x * columns) / width));
 
-  // Per-channel row LUTs for RGB modes (row only depends on the 8-bit value).
   const sigF = luts.sigFine || luts.sig;
   const lightF = luts.lightFine || luts.light;
+  const axisF = axis === 'pq' ? luts.pqFine : sigF;
   const fineShift = sigF[0].length === 1024 ? 2 : 0;
+  // Per-channel row LUTs for RGB modes (row only depends on the channel value).
   const rowLut = [0, 1, 2].map((c) => {
     const t = new Int32Array(sigF[c].length);
-    for (let v = 0; v < t.length; v++) t[v] = stops ? toRowStops(lightF[c][v]) : toRow(sigF[c][v]);
+    for (let v = 0; v < t.length; v++) t[v] = stops ? toRowStops(lightF[c][v]) : toRow(axisF[c][v]);
     return t;
   });
 
@@ -199,10 +309,11 @@ export function computeWaveform(data, width, height, opts) {
   const stopBinScale = HIST_BINS / (STOP_HI - STOP_LO);
   const [sR, sG, sB] = sigF;
   const [lR, lG, lB] = lightF;
+  const [aR, aG, aB] = axisF;
+  const [kr, kg, kb] = LUMA;
   const dMask = fineShift ? 3 : 0;
   let seed = 0x9e3779b9;
-  const [kr, kg, kb] = LUMA;
-  let clipped = 0, overWhite = 0, sum = 0;
+  let clipped = 0, overWhite = 0, sum = 0, sumLight = 0;
 
   for (let y = 0; y < height; y++) {
     let i = y * width * 4;
@@ -218,7 +329,9 @@ export function computeWaveform(data, width, height, opts) {
       const lg = yl > 1e-9 ? Math.log2(yl) : -99;
 
       if (nCh === 1) {
-        bins[0][(stops ? toRow(lg) : toRow(ys)) * columns + col]++;
+        // Y' from the encoded channels, as a Y waveform does.
+        const v = stops ? lg : kr * aR[ri] + kg * aG[gi] + kb * aB[bi];
+        bins[0][toRow(v) * columns + col]++;
       } else {
         bins[0][rowLut[0][ri] * columns + col]++;
         bins[1][rowLut[1][gi] * columns + col]++;
@@ -230,20 +343,21 @@ export function computeWaveform(data, width, height, opts) {
       hb = ((lg - STOP_LO) * stopBinScale) | 0;
       lightHist[hb < 0 ? 0 : hb >= HIST_BINS ? HIST_BINS - 1 : hb]++;
       if (r >= 254 || g >= 254 || b >= 254) clipped++;
-      if (ys > 1.005) overWhite++;
+      if (yl > 1.01) overWhite++;
       sum += ys;
+      sumLight += yl;
     }
   }
 
   const n = width * height;
-  const pct = (hist, p, lo, hi) => {
+  const pct = (hist, p, lo2, hi2) => {
     const target = p * n;
     let acc = 0;
     for (let k = 0; k < HIST_BINS; k++) {
       acc += hist[k];
-      if (acc >= target) return lo + ((k + 0.5) * (hi - lo)) / HIST_BINS;
+      if (acc >= target) return lo2 + ((k + 0.5) * (hi2 - lo2)) / HIST_BINS;
     }
-    return hi;
+    return hi2;
   };
   const floorStops = pct(lightHist, 0.001, STOP_LO, STOP_HI);
   const peakStops = pct(lightHist, 0.999, STOP_LO, STOP_HI);
@@ -252,6 +366,7 @@ export function computeWaveform(data, width, height, opts) {
     peak: pct(sigHist, 0.999, SIG_LO, SIG_HI),
     median: pct(sigHist, 0.5, SIG_LO, SIG_HI),
     mean: n ? sum / n : 0,
+    meanLight: n ? sumLight / n : 0,
     floorStops,
     peakStops,
     rangeStops: peakStops - floorStops,
@@ -260,7 +375,7 @@ export function computeWaveform(data, width, height, opts) {
     pixels: n,
   };
 
-  return { bins, columns, rows, samplesPerColumn: height * (width / columns), mode, scale, stopsRange, stats };
+  return { bins, columns, rows, samplesPerColumn: height * (width / columns), mode, axis, stopsRange, stats };
 }
 
 // ---------------------------------------------------------------------------
@@ -272,13 +387,14 @@ const TRACE_COLORS = {
   rgb: [[255, 72, 64], [64, 255, 96], [72, 140, 255]],
 };
 
-/** Convert accumulated bins to an RGBA ImageData-compatible buffer (alpha = intensity). */
+/** Convert accumulated bins to RGBA buffers (alpha = intensity), one per channel. */
 export function traceToRGBA(wf, gain = 1.5) {
   const { bins, columns, rows, samplesPerColumn } = wf;
-  const k = (gain * 0.35 * rows) / Math.max(1, samplesPerColumn);
+  // Overlay adds three traces on top of each other, so each one is drawn a little dimmer.
+  const modeGain = wf.mode === 'overlay' ? 0.6 : 1;
+  const k = (gain * modeGain * 0.35 * rows) / Math.max(1, samplesPerColumn);
   const colors = bins.length === 1 ? TRACE_COLORS.luma : TRACE_COLORS.rgb;
   const intensity = new Float32Array(1024);
-  // count -> intensity via 1 - exp(-k*count); cache for small counts.
   for (let c = 0; c < intensity.length; c++) intensity[c] = 1 - Math.exp(-k * c);
   const out = [];
   for (let ch = 0; ch < bins.length; ch++) {
@@ -303,11 +419,11 @@ export function traceToRGBA(wf, gain = 1.5) {
 
 /**
  * Draw a full scope panel into ctx at (x, y, w, h).
- * opts: {gain, background (css color|null), luts, calibrated, showLabels, statsText}
+ * opts: {gain, background, unit, format, peakNits, displayTF, blackLight, statsText, caption}
  */
 export function drawScope(ctx, wf, x, y, w, h, opts = {}) {
-  const { gain = 1.5, background = '#0b0d0e', blackLight = null, statsText = '' } = opts;
-  const { lo, hi } = scaleRange(wf.scale, wf.stopsRange);
+  const { gain = 1.5, background = '#0b0d0e', blackLight = null, statsText = '', caption = '' } = opts;
+  const { lo, hi } = scaleRange(wf.axis, wf.stopsRange);
   const panels = wf.mode === 'parade' ? 3 : 1;
   const font = Math.max(10, Math.round(Math.min(w / 40, Math.max(h / 28, w / 70))));
 
@@ -320,21 +436,24 @@ export function drawScope(ctx, wf, x, y, w, h, opts = {}) {
     ctx.fillRect(x, y, w, h);
   }
 
-  const rowToY = (v) => y + ((hi - v) / (hi - lo)) * (h - 1);
-  const lines = graticule(wf.scale, wf.stopsRange);
+  const valueToY = (v) => y + ((hi - v) / (hi - lo)) * (h - 1);
+  const lines = graticule(wf.axis, opts.unit, { ...opts, stopsRange: wf.stopsRange });
+  const peakValue = wf.axis === 'stops' ? 0 : 1;
 
   // Graticule
   ctx.lineWidth = Math.max(1, Math.round(h / 400));
   for (const ln of lines) {
-    const ly = Math.round(rowToY(ln.value)) + 0.5;
-    ctx.strokeStyle = ln.major ? 'rgba(200,170,90,0.42)' : 'rgba(200,170,90,0.22)';
+    const ly = Math.round(valueToY(ln.value)) + 0.5;
+    ctx.strokeStyle = ln.value === peakValue ? 'rgba(240,190,90,0.75)'
+      : ln.major ? 'rgba(200,170,90,0.42)' : 'rgba(200,170,90,0.22)';
     ctx.beginPath();
     ctx.moveTo(x, ly);
     ctx.lineTo(x + w, ly);
     ctx.stroke();
   }
-  if (wf.scale === 'stops' && blackLight) {
-    const ly = Math.round(rowToY(Math.log2(blackLight))) + 0.5;
+  // Measured projector black floor (light, so only meaningful on light-based axes).
+  if (blackLight && wf.axis !== 'sdr') {
+    const ly = Math.round(valueToY(lightToAxis(blackLight, wf.axis, opts))) + 0.5;
     ctx.setLineDash([6, 4]);
     ctx.strokeStyle = 'rgba(120,170,255,0.8)';
     ctx.beginPath();
@@ -370,21 +489,30 @@ export function drawScope(ctx, wf, x, y, w, h, opts = {}) {
     }
   }
 
-  // Labels
+  // Legend
   ctx.font = `${font}px ui-monospace, Menlo, Consolas, monospace`;
   ctx.textBaseline = 'middle';
-  ctx.fillStyle = 'rgba(225,200,140,0.85)';
   ctx.shadowColor = 'rgba(0,0,0,0.9)';
   ctx.shadowBlur = 3;
   for (const ln of lines) {
-    if (!ln.major && h < 260) continue;
-    const ly = rowToY(ln.value);
-    ctx.fillText(ln.label, x + font * 0.4, Math.min(Math.max(ly, y + font * 0.6), y + h - font * 0.6));
+    if (!ln.major && h < 260 && ln.value !== peakValue) continue;
+    const ly = valueToY(ln.value);
+    const ty = Math.min(Math.max(ly, y + font * 0.6), y + h - font * 0.6);
+    const tw = ctx.measureText(ln.label).width;
+    ctx.shadowBlur = 0;
+    ctx.fillStyle = 'rgba(8,10,11,0.72)';
+    ctx.fillRect(x + font * 0.2, ty - font * 0.55, tw + font * 0.4, font * 1.1);
+    ctx.fillStyle = ln.value === peakValue ? 'rgba(250,205,120,0.95)' : 'rgba(225,200,140,0.9)';
+    ctx.fillText(ln.label, x + font * 0.4, ty);
+  }
+  ctx.textAlign = 'right';
+  if (caption) {
+    ctx.textBaseline = 'bottom';
+    ctx.fillStyle = 'rgba(200,200,200,0.6)';
+    ctx.fillText(caption, x + w - font * 0.5, y + h - font * 0.3);
   }
   if (statsText) {
-    ctx.textAlign = 'right';
     ctx.textBaseline = 'top';
-    ctx.fillStyle = 'rgba(235,235,235,0.9)';
     const lines2 = Array.isArray(statsText) ? statsText : [statsText];
     const tw = Math.max(...lines2.map((t) => ctx.measureText(t).width));
     ctx.shadowBlur = 0;
@@ -392,7 +520,6 @@ export function drawScope(ctx, wf, x, y, w, h, opts = {}) {
     ctx.fillRect(x + w - tw - font, y, tw + font, font * (0.8 + lines2.length * 1.25));
     ctx.fillStyle = 'rgba(235,235,235,0.9)';
     lines2.forEach((t, i) => ctx.fillText(t, x + w - font * 0.5, y + font * 0.4 + i * font * 1.25));
-    ctx.textAlign = 'left';
   }
   ctx.restore();
 }
@@ -403,14 +530,4 @@ function makeCanvas(w, h) {
   c.width = w;
   c.height = h;
   return c;
-}
-
-/** Human readable stats lines for a scale. */
-export function statsLines(stats, scale, calibrated) {
-  const f = (v) => formatValue(scale === 'stops' ? 'percent' : scale, v);
-  const sig = `Floor ${f(stats.floor)}  Peak ${f(stats.peak)}  Mean ${f(stats.mean)}`;
-  const dr = calibrated
-    ? `Light ${stats.peakStops.toFixed(1)} → ${stats.floorStops.toFixed(1)} st  (${stats.rangeStops.toFixed(1)} stops)`
-    : `Range ${stats.rangeStops.toFixed(1)} stops (uncalibrated)`;
-  return [sig, dr];
 }
