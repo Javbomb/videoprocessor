@@ -297,28 +297,47 @@ export function statsLines(stats, o) {
   ];
 }
 
-/** In-place 3x3 box blur of RGBA pixels: removes camera noise before the scope. */
-export function denoiseRGBA(data, w, h) {
-  const tmp = new Uint16Array(w * h * 3);
-  for (let y = 0; y < h; y++) {
-    for (let x = 0; x < w; x++) {
-      const xl = x > 0 ? x - 1 : x, xr = x < w - 1 ? x + 1 : x;
-      const o = (y * w + x) * 3, a = (y * w + xl) * 4, b = (y * w + x) * 4, c = (y * w + xr) * 4;
-      tmp[o] = data[a] + data[b] + data[c];
-      tmp[o + 1] = data[a + 1] + data[b + 1] + data[c + 1];
-      tmp[o + 2] = data[a + 2] + data[b + 2] + data[c + 2];
+/**
+ * Low-pass filter (like the LPF option on Resolve's scopes and hardware waveform
+ * monitors): an approximately Gaussian blur, three box passes of `radius`, applied
+ * in place to RGBA pixels. Removes camera noise and fine texture so the trace
+ * shows the picture's tonal structure.
+ */
+export function lowPassRGBA(data, w, h, radius) {
+  const r = Math.max(0, Math.round(radius));
+  if (!r) return data;
+  const n = w * h;
+  const ch = [new Float32Array(n), new Float32Array(n), new Float32Array(n)];
+  for (let i = 0, j = 0; i < n; i++, j += 4) { ch[0][i] = data[j]; ch[1][i] = data[j + 1]; ch[2][i] = data[j + 2]; }
+  const tmp = new Float32Array(Math.max(w, h));
+  const pass = (a, len, count, stride, step) => {
+    // box blur along lines: `count` lines of `len` samples
+    for (let l = 0; l < count; l++) {
+      const base = l * stride;
+      let acc = 0;
+      for (let k = -r; k <= r; k++) acc += a[base + Math.min(len - 1, Math.max(0, k)) * step];
+      for (let x = 0; x < len; x++) {
+        tmp[x] = acc / (2 * r + 1);
+        acc += a[base + Math.min(len - 1, x + r + 1) * step] - a[base + Math.max(0, x - r) * step];
+      }
+      for (let x = 0; x < len; x++) a[base + x * step] = tmp[x];
+    }
+  };
+  for (const a of ch) {
+    for (let it = 0; it < 3; it++) {
+      pass(a, w, h, w, 1);
+      pass(a, h, w, 1, w);
     }
   }
-  for (let y = 0; y < h; y++) {
-    const yu = y > 0 ? y - 1 : y, yd = y < h - 1 ? y + 1 : y;
-    for (let x = 0; x < w; x++) {
-      const o = (y * w + x) * 4, a = (yu * w + x) * 3, b = (y * w + x) * 3, c = (yd * w + x) * 3;
-      data[o] = (tmp[a] + tmp[b] + tmp[c] + 4) / 9;
-      data[o + 1] = (tmp[a + 1] + tmp[b + 1] + tmp[c + 1] + 4) / 9;
-      data[o + 2] = (tmp[a + 2] + tmp[b + 2] + tmp[c + 2] + 4) / 9;
-    }
-  }
+  for (let i = 0, j = 0; i < n; i++, j += 4) { data[j] = ch[0][i]; data[j + 1] = ch[1][i]; data[j + 2] = ch[2][i]; }
   return data;
+}
+
+/** Low-pass radius (analysis pixels) for a strength setting and analysis width. */
+export function lowPassRadius(level, analysisWidth) {
+  if (level === 'high') return Math.max(2, Math.round(analysisWidth / 300));
+  if (level === 'low') return Math.max(1, Math.round(analysisWidth / 550));
+  return 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -452,35 +471,50 @@ const TRACE_COLORS = {
   rgb: [[255, 72, 64], [64, 255, 96], [72, 140, 255]],
 };
 
-/** Convert accumulated bins to RGBA buffers (alpha = intensity), one per channel. */
+/**
+ * Convert accumulated bins to RGBA buffers (alpha = intensity), one per channel.
+ * Like Resolve, brightness follows *density*: a lone stray sample is barely visible,
+ * while many samples landing together build a bright line. Bins are smoothed with a
+ * [1 2 1] kernel both ways first, so traces read as continuous strokes.
+ */
 export function traceToRGBA(wf, gain = 1.5) {
   const { bins, columns, rows, samplesPerColumn } = wf;
-  // Overlay adds three traces on top of each other, so each one is drawn a little dimmer.
-  const modeGain = wf.mode === 'overlay' ? 0.6 : 1;
-  const k = (gain * modeGain * 0.35 * rows) / Math.max(1, samplesPerColumn);
+  // Density relative to an even spread of a column's samples over all rows.
+  const uniform = Math.max(1e-6, samplesPerColumn / rows);
+  const g = (gain * 0.09) / uniform;
+  const modeGain = wf.mode === 'overlay' ? 0.75 : 1;
   const colors = bins.length === 1 ? TRACE_COLORS.luma : TRACE_COLORS.rgb;
-  const intensity = new Float32Array(1024);
-  for (let c = 0; c < intensity.length; c++) intensity[c] = 1 - Math.exp(-k * c);
   const out = [];
+  const tmp = new Float32Array(columns * rows);
   for (let ch = 0; ch < bins.length; ch++) {
-    // Smooth each column vertically ([1 2 1]/4) so traces read as continuous lines.
     const raw = bins[ch];
-    const b = new Float32Array(raw.length);
+    // horizontal [1 2 1]
     for (let r = 0; r < rows; r++) {
-      const up = r > 0 ? (r - 1) * columns : r * columns, me = r * columns, dn = r < rows - 1 ? (r + 1) * columns : r * columns;
-      for (let c = 0; c < columns; c++) b[me + c] = (raw[up + c] + 2 * raw[me + c] + raw[dn + c]) * 0.25;
+      const o = r * columns;
+      for (let c = 0; c < columns; c++) {
+        const l = c > 0 ? raw[o + c - 1] : raw[o + c], rr = c < columns - 1 ? raw[o + c + 1] : raw[o + c];
+        tmp[o + c] = (l + 2 * raw[o + c] + rr) * 0.25;
+      }
+    }
+    // vertical [1 2 1]
+    const b = new Float32Array(columns * rows);
+    for (let r = 0; r < rows; r++) {
+      const up = (r > 0 ? r - 1 : r) * columns, me = r * columns, dn = (r < rows - 1 ? r + 1 : r) * columns;
+      for (let c = 0; c < columns; c++) b[me + c] = (tmp[up + c] + 2 * tmp[me + c] + tmp[dn + c]) * 0.25;
     }
     const px = new Uint8ClampedArray(columns * rows * 4);
     const [cr, cg, cb] = colors[ch];
     for (let i = 0, j = 0; i < b.length; i++, j += 4) {
       const cnt = b[i];
-      if (cnt < 0.05) continue;
-      const a = cnt < 1023 ? intensity[cnt | 0] + (intensity[(cnt | 0) + 1] - intensity[cnt | 0]) * (cnt - (cnt | 0)) : 1 - Math.exp(-k * cnt);
-      // Hot spots bloom towards white, like a phosphor scope.
-      const hot = a > 0.85 ? (a - 0.85) / 0.15 : 0;
-      px[j] = cr + (255 - cr) * hot * 0.6;
-      px[j + 1] = cg + (255 - cg) * hot * 0.6;
-      px[j + 2] = cb + (255 - cb) * hot * 0.6;
+      if (cnt <= 0) continue;
+      // 1 - exp(-(d)^1.4): soft toe keeps sparse noise dim, dense traces saturate.
+      const d = cnt * g;
+      const a = modeGain * (1 - Math.exp(-Math.pow(d, 1.4)));
+      if (a < 0.004) continue;
+      const hot = a > 0.8 ? (a - 0.8) / 0.2 : 0;
+      px[j] = cr + (255 - cr) * hot * 0.55;
+      px[j + 1] = cg + (255 - cg) * hot * 0.55;
+      px[j + 2] = cb + (255 - cb) * hot * 0.55;
       px[j + 3] = a * 255;
     }
     out.push(px);
