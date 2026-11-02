@@ -907,7 +907,39 @@ function stopRecording() {
   requestRender();
 }
 
+// Running inside the native app (Capacitor)? Then save through native plugins.
+const NATIVE = !!(window.Capacitor && window.Capacitor.isNativePlatform && window.Capacitor.isNativePlatform());
+
+function blobToBase64(blob) {
+  return new Promise((resolve, reject) => {
+    const r = new FileReader();
+    r.onload = () => resolve(String(r.result).split(',')[1]);
+    r.onerror = () => reject(r.error);
+    r.readAsDataURL(blob);
+  });
+}
+
+/** Native app: keep a copy in Documents/ProjectorWaveform and open the share sheet (Save to Photos, Drive, ...). */
+async function deliverNative(file) {
+  const { Filesystem, Share } = window.Capacitor.Plugins;
+  const data = await blobToBase64(file);
+  let kept = '';
+  try {
+    await Filesystem.writeFile({ path: `ProjectorWaveform/${file.name}`, data, directory: 'DOCUMENTS', recursive: true });
+    kept = ' Saved to Documents/ProjectorWaveform.';
+  } catch { /* storage not available on this Android version; the share sheet still works */ }
+  const { uri } = await Filesystem.writeFile({ path: file.name, data, directory: 'CACHE' });
+  const share = async () => {
+    try { await Share.share({ title: file.name, files: [uri] }); } catch { /* cancelled */ }
+  };
+  toast(`${file.name} ready.${kept}`, 12000, [{ label: 'Share / Save to Photos', onClick: share }]);
+  await share();
+}
+
 async function deliverFile(file, deferred = false) {
+  if (NATIVE) {
+    try { await deliverNative(file); return; } catch (err) { console.error(err); }
+  }
   const coarse = window.matchMedia('(pointer: coarse)').matches;
   const canShare = coarse && navigator.canShare && navigator.canShare({ files: [file] });
   const share = async () => {
@@ -1122,7 +1154,7 @@ bindUI();
 syncUI();
 showCalibration();
 
-if ('serviceWorker' in navigator && (location.protocol === 'https:' || location.hostname === 'localhost')) {
+if (!NATIVE && 'serviceWorker' in navigator && (location.protocol === 'https:' || location.hostname === 'localhost')) {
   navigator.serviceWorker.register('sw.js').catch(() => {});
 }
 

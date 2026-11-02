@@ -1,0 +1,13 @@
+{
+  "appId": "com.javbomb.projectorwaveform",
+  "appName": "Projector Waveform",
+  "webDir": "www",
+  "backgroundColor": "#0b0d0e",
+  "android": {
+    "backgroundColor": "#0b0d0e"
+  },
+  "ios": {
+    "backgroundColor": "#0b0d0e",
+    "contentInset": "always"
+  }
+}

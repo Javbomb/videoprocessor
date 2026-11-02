@@ -1,0 +1,79 @@
+name: Android app
+
+on:
+  push:
+    branches: [main, waveform-standalone]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: android-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - uses: android-actions/setup-android@v3
+
+      - name: Install
+        run: npm ci
+
+      - name: Test
+        run: npm test
+
+      - name: Generate the native Android project
+        run: |
+          npm run build:web
+          npx cap add android
+          node scripts/native-config.mjs
+          npx capacitor-assets generate --android
+          npx cap sync android
+
+      # Keep one debug signing key across builds so a new APK installs over the old one.
+      - name: Stable signing key
+        uses: actions/cache@v4
+        with:
+          path: ~/.android/debug.keystore
+          key: android-debug-keystore-v1
+
+      - name: Build APK
+        working-directory: android
+        run: ./gradlew assembleDebug --no-daemon --stacktrace
+
+      - name: Collect
+        run: |
+          mkdir -p dist
+          cp android/app/build/outputs/apk/debug/app-debug.apk dist/ProjectorWaveform.apk
+          ls -la dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ProjectorWaveform-apk
+          path: dist/ProjectorWaveform.apk
+
+      - name: Publish to the rolling release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="android-latest-${GITHUB_REF_NAME//\//-}"
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            gh release create "$TAG" --prerelease --target "$GITHUB_SHA" \
+              --title "Projector Waveform for Android (latest ${GITHUB_REF_NAME})" \
+              --notes "Built automatically from the latest commit on ${GITHUB_REF_NAME}. On your Android phone, download ProjectorWaveform.apk and open it to install (allow installs from your browser when asked)."
+          fi
+          gh release upload "$TAG" dist/ProjectorWaveform.apk --clobber

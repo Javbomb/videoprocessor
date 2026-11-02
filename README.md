@@ -33,6 +33,26 @@ The scope measures what the camera recorded, so the photos matter:
 
 Without calibration, the scope shows the photo's own code values, the same as running Resolve on the JPEG.
 
+## Phone app
+
+The same app is packaged as a native phone app with [Capacitor](https://capacitorjs.com). Open and save go through the phone's own gallery and share sheet ("Save to Photos", Drive, Files). Saves are also kept in *Documents/ProjectorWaveform* on Android.
+
+**Android:** every push builds an APK with GitHub Actions (`.github/workflows/android.yml`) and attaches it to the **android-latest-…** release under *Releases*. On the phone, open that release, download `ProjectorWaveform.apk` and open it. Android asks once to allow installs from your browser. Later builds install over the top.
+
+To build it yourself you need Android Studio (or the Android SDK) and JDK 21:
+
+```
+npm install
+npm run build:web
+npx cap add android
+node scripts/native-config.mjs
+npx capacitor-assets generate --android
+npx cap sync android
+npx cap open android     # then Run, or: cd android && ./gradlew assembleDebug
+```
+
+**iPhone:** iOS apps can only be built on a Mac with Xcode, and installing on a phone needs an Apple ID (free for 7-day installs, or the paid developer program). On a Mac: the same steps with `ios` instead of `android`, then `npx cap open ios` and Run on your phone. Until then, the web version works from Safari via *Share → Add to Home Screen*.
+
 ## Running it on your computer
 
 There's no build step and nothing to install except [Node.js](https://nodejs.org) 18 or newer.
