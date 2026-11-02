@@ -223,9 +223,39 @@ export function graticule(axis, unit, o = {}) {
     ladder(PCT_STEPS.map((p) => ({ value: lightToAxis(p / 100, axis, o), label: p + '%', major: isDecade(p) })));
     lines.push({ value: 1, label: '100%', major: true });
   } else {
-    for (let p = 0; p <= 100; p += 10) lines.push({ value: p / 100, label: p === 100 ? '100 IRE' : String(p), major: p % 50 === 0 });
+    for (let p = 0; p <= 100; p += 10) lines.push({ value: p / 100, label: p === 100 ? '100 IRE' : String(p), major: true });
   }
   return lines;
+}
+
+/** Minor ruler ticks (axis values) between the graticule lines. */
+export function minorTicks(axis, unit, o = {}) {
+  const { peakNits = 100, stopsRange = 10 } = o;
+  const out = [];
+  if (axis === 'stops') {
+    for (let s = 0; s >= -stopsRange; s -= 0.25) if (s % 1) out.push(s);
+  } else if (axis === 'sdr' && unit === 'code') {
+    for (let cv = 32; cv < 1023; cv += 32) if (cv % 128) out.push(cv / 1023);
+  } else if (axis === 'sdr' && unit === 'nits') {
+    for (const n of decadeSteps(peakNits)) out.push(lightToAxis(n / peakNits, axis, o));
+  } else if (axis === 'sdr') {
+    for (let p = 2; p < 100; p += 2) if (p % 10) out.push(p / 100);
+  } else if (unit === 'code') {
+    const top = pqEncode(peakNits);
+    for (let cv = 16; cv < top * 1023; cv += 16) if (cv % 64) out.push(cv / 1023 / top);
+  } else if (unit === 'nits') {
+    for (const n of decadeSteps(peakNits)) out.push(lightToAxis(n / peakNits, axis, o));
+  } else {
+    for (const p of decadeSteps(100)) out.push(lightToAxis(p / 100, axis, o));
+  }
+  return out.filter((v) => v > 0 && v < 1 || axis === 'stops');
+}
+
+/** 1..9 x each decade below `top` (log-style minor ticks). */
+function decadeSteps(top) {
+  const out = [];
+  for (let d = 0.01; d < top; d *= 10) for (let k = 1; k <= 9; k++) if (k * d < top) out.push(k * d);
+  return out;
 }
 
 /**
@@ -265,6 +295,30 @@ export function statsLines(stats, o) {
     `Peak ${f.peak}  Floor ${f.floor}${f.apl ? '  APL ' + f.apl : ''}`,
     `ADL ${f.adl}  ${stats.rangeStops.toFixed(1)} stops${cal}`,
   ];
+}
+
+/** In-place 3x3 box blur of RGBA pixels: removes camera noise before the scope. */
+export function denoiseRGBA(data, w, h) {
+  const tmp = new Uint16Array(w * h * 3);
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      const xl = x > 0 ? x - 1 : x, xr = x < w - 1 ? x + 1 : x;
+      const o = (y * w + x) * 3, a = (y * w + xl) * 4, b = (y * w + x) * 4, c = (y * w + xr) * 4;
+      tmp[o] = data[a] + data[b] + data[c];
+      tmp[o + 1] = data[a + 1] + data[b + 1] + data[c + 1];
+      tmp[o + 2] = data[a + 2] + data[b + 2] + data[c + 2];
+    }
+  }
+  for (let y = 0; y < h; y++) {
+    const yu = y > 0 ? y - 1 : y, yd = y < h - 1 ? y + 1 : y;
+    for (let x = 0; x < w; x++) {
+      const o = (y * w + x) * 4, a = (yu * w + x) * 3, b = (y * w + x) * 3, c = (yd * w + x) * 3;
+      data[o] = (tmp[a] + tmp[b] + tmp[c] + 4) / 9;
+      data[o + 1] = (tmp[a + 1] + tmp[b + 1] + tmp[c + 1] + 4) / 9;
+      data[o + 2] = (tmp[a + 2] + tmp[b + 2] + tmp[c + 2] + 4) / 9;
+    }
+  }
+  return data;
 }
 
 // ---------------------------------------------------------------------------
@@ -409,13 +463,19 @@ export function traceToRGBA(wf, gain = 1.5) {
   for (let c = 0; c < intensity.length; c++) intensity[c] = 1 - Math.exp(-k * c);
   const out = [];
   for (let ch = 0; ch < bins.length; ch++) {
-    const b = bins[ch];
+    // Smooth each column vertically ([1 2 1]/4) so traces read as continuous lines.
+    const raw = bins[ch];
+    const b = new Float32Array(raw.length);
+    for (let r = 0; r < rows; r++) {
+      const up = r > 0 ? (r - 1) * columns : r * columns, me = r * columns, dn = r < rows - 1 ? (r + 1) * columns : r * columns;
+      for (let c = 0; c < columns; c++) b[me + c] = (raw[up + c] + 2 * raw[me + c] + raw[dn + c]) * 0.25;
+    }
     const px = new Uint8ClampedArray(columns * rows * 4);
     const [cr, cg, cb] = colors[ch];
     for (let i = 0, j = 0; i < b.length; i++, j += 4) {
       const cnt = b[i];
-      if (!cnt) continue;
-      const a = cnt < 1024 ? intensity[cnt] : 1 - Math.exp(-k * cnt);
+      if (cnt < 0.05) continue;
+      const a = cnt < 1023 ? intensity[cnt | 0] + (intensity[(cnt | 0) + 1] - intensity[cnt | 0]) * (cnt - (cnt | 0)) : 1 - Math.exp(-k * cnt);
       // Hot spots bloom towards white, like a phosphor scope.
       const hot = a > 0.85 ? (a - 0.85) / 0.15 : 0;
       px[j] = cr + (255 - cr) * hot * 0.6;
@@ -428,19 +488,49 @@ export function traceToRGBA(wf, gain = 1.5) {
   return out;
 }
 
+export const SCOPE_FONT = 'ui-monospace, Menlo, Consolas, monospace';
+
+/** Default legend font size (px) for a plot of w x h. */
+export function scopeFontSize(w, h) {
+  return Math.max(11, Math.round(Math.min(w / 40, Math.max(h / 28, w / 70))));
+}
+
 /**
- * Draw a full scope panel into ctx at (x, y, w, h).
- * opts: {gain, background, unit, format, peakNits, displayTF, blackLight, statsText, caption}
+ * Margins around the plot so the legend and stats never sit on the trace.
+ * `measure` is a 2D context used to measure the labels.
+ * Returns {font, left, top, bottom, right} in pixels.
+ */
+export function scopePadding(measure, w, h, axis, unit, o = {}) {
+  const font = o.font || scopeFontSize(w, h);
+  measure.font = `${font}px ${SCOPE_FONT}`;
+  const labels = graticule(axis, unit, o).map((l) => l.label);
+  const lw = Math.max(...labels.map((t) => measure.measureText(t).width));
+  const even = (v) => Math.ceil(v / 2) * 2;
+  return {
+    font,
+    left: even(lw + font * 1.1),
+    top: even(o.stats ? font * 3.0 : font * 1.0),
+    bottom: even(font * 1.7),
+    right: even(font * 0.6),
+  };
+}
+
+/**
+ * Draw a scope into ctx. (x, y, w, h) is the plot area; the trace maps exactly onto it.
+ * With opts.pad (from scopePadding) the legend goes in a gutter to the left, the stats
+ * in a strip above and the caption in a strip below, outside the plot.
+ * opts: {gain, background, unit, format, peakNits, displayTF, blackLight, statsText, caption, pad}
  */
 export function drawScope(ctx, wf, x, y, w, h, opts = {}) {
-  const { gain = 1.5, background = '#0b0d0e', blackLight = null, statsText = '', caption = '' } = opts;
+  const { gain = 1.5, background = '#0b0d0e', blackLight = null, statsText = '', caption = '', pad = null } = opts;
   const { lo, hi } = scaleRange(wf.axis, wf.stopsRange);
   const panels = wf.mode === 'parade' ? 3 : 1;
-  const font = Math.max(10, Math.round(Math.min(w / 40, Math.max(h / 28, w / 70))));
+  const font = pad ? pad.font : scopeFontSize(w, h);
+  const P = pad || { left: 0, top: 0, bottom: 0, right: 0 };
 
   ctx.save();
   ctx.beginPath();
-  ctx.rect(x, y, w, h);
+  ctx.rect(x - P.left, y - P.top, w + P.left + P.right, h + P.top + P.bottom);
   ctx.clip();
   if (background) {
     ctx.fillStyle = background;
@@ -451,15 +541,37 @@ export function drawScope(ctx, wf, x, y, w, h, opts = {}) {
   const lines = graticule(wf.axis, opts.unit, { ...opts, stopsRange: wf.stopsRange });
   const peakValue = wf.axis === 'stops' ? 0 : 1;
 
-  // Graticule
+  // Graticule (with a short tick into the gutter when there is one)
   ctx.lineWidth = Math.max(1, Math.round(h / 400));
+  const tick = pad ? font * 0.35 : 0;
   for (const ln of lines) {
     const ly = Math.round(valueToY(ln.value)) + 0.5;
     ctx.strokeStyle = ln.value === peakValue ? 'rgba(240,190,90,0.75)'
       : ln.major ? 'rgba(200,170,90,0.42)' : 'rgba(200,170,90,0.22)';
     ctx.beginPath();
-    ctx.moveTo(x, ly);
+    ctx.moveTo(x - tick, ly);
     ctx.lineTo(x + w, ly);
+    ctx.stroke();
+  }
+  if (pad) {
+    // Ruler like Resolve: a line down the plot's left edge with minor ticks, and ticks along the bottom.
+    ctx.strokeStyle = 'rgba(200,170,90,0.55)';
+    ctx.beginPath();
+    ctx.moveTo(x - 0.5, y);
+    ctx.lineTo(x - 0.5, y + h);
+    for (const v of minorTicks(wf.axis, opts.unit, { ...opts, stopsRange: wf.stopsRange })) {
+      if (v > hi || v < lo) continue;
+      const ty = Math.round(valueToY(v)) + 0.5;
+      ctx.moveTo(x - tick * 0.6, ty);
+      ctx.lineTo(x, ty);
+    }
+    ctx.moveTo(x, y + h + 0.5);
+    ctx.lineTo(x + w, y + h + 0.5);
+    for (let k = 0; k <= 40; k++) {
+      const tx = Math.round(x + (k * (w - 1)) / 40) + 0.5;
+      ctx.moveTo(tx, y + h);
+      ctx.lineTo(tx, y + h + (k % 4 === 0 ? tick : tick * 0.5));
+    }
     ctx.stroke();
   }
   // Measured projector black floor (light, so only meaningful on light-based axes).
@@ -479,6 +591,10 @@ export function drawScope(ctx, wf, x, y, w, h, opts = {}) {
   const tmp = makeCanvas(wf.columns, wf.rows);
   const tctx = tmp.getContext('2d');
   const panelW = w / panels;
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(x, y, w, h);
+  ctx.clip();
   ctx.imageSmoothingEnabled = true;
   ctx.globalCompositeOperation = 'lighter';
   for (let ch = 0; ch < rgba.length; ch++) {
@@ -486,7 +602,7 @@ export function drawScope(ctx, wf, x, y, w, h, opts = {}) {
     const px = panels === 3 ? x + ch * panelW : x;
     ctx.drawImage(tmp, px, y, panelW, h);
   }
-  ctx.globalCompositeOperation = 'source-over';
+  ctx.restore();
 
   // Parade separators
   if (panels === 3) {
@@ -501,36 +617,49 @@ export function drawScope(ctx, wf, x, y, w, h, opts = {}) {
   }
 
   // Legend
-  ctx.font = `${font}px ui-monospace, Menlo, Consolas, monospace`;
+  ctx.font = `${font}px ${SCOPE_FONT}`;
   ctx.textBaseline = 'middle';
-  ctx.shadowColor = 'rgba(0,0,0,0.9)';
-  ctx.shadowBlur = 3;
-  for (const ln of lines) {
-    if (!ln.major && h < 260 && ln.value !== peakValue) continue;
-    const ly = valueToY(ln.value);
-    const ty = Math.min(Math.max(ly, y + font * 0.6), y + h - font * 0.6);
-    const tw = ctx.measureText(ln.label).width;
-    ctx.shadowBlur = 0;
-    ctx.fillStyle = 'rgba(8,10,11,0.72)';
-    ctx.fillRect(x + font * 0.2, ty - font * 0.55, tw + font * 0.4, font * 1.1);
-    ctx.fillStyle = ln.value === peakValue ? 'rgba(250,205,120,0.95)' : 'rgba(225,200,140,0.9)';
-    ctx.fillText(ln.label, x + font * 0.4, ty);
+  if (pad) {
+    // In the gutter, right-aligned against the plot.
+    ctx.textAlign = 'right';
+    for (const ln of lines) {
+      if (!ln.major && h < 260 && ln.value !== peakValue) continue;
+      ctx.fillStyle = ln.value === peakValue ? 'rgba(250,205,120,0.95)' : 'rgba(225,200,140,0.9)';
+      ctx.fillText(ln.label, x - tick - font * 0.3, valueToY(ln.value));
+    }
+  } else {
+    // No room outside: draw on a dark backing inside the plot.
+    ctx.textAlign = 'left';
+    for (const ln of lines) {
+      if (!ln.major && h < 260 && ln.value !== peakValue) continue;
+      const ty = Math.min(Math.max(valueToY(ln.value), y + font * 0.6), y + h - font * 0.6);
+      const tw = ctx.measureText(ln.label).width;
+      ctx.fillStyle = 'rgba(8,10,11,0.72)';
+      ctx.fillRect(x + font * 0.2, ty - font * 0.55, tw + font * 0.4, font * 1.1);
+      ctx.fillStyle = ln.value === peakValue ? 'rgba(250,205,120,0.95)' : 'rgba(225,200,140,0.9)';
+      ctx.fillText(ln.label, x + font * 0.4, ty);
+    }
   }
   ctx.textAlign = 'right';
   if (caption) {
-    ctx.textBaseline = 'bottom';
+    ctx.textBaseline = pad ? 'middle' : 'bottom';
     ctx.fillStyle = 'rgba(200,200,200,0.6)';
-    ctx.fillText(caption, x + w - font * 0.5, y + h - font * 0.3);
+    ctx.fillText(caption, x + w - font * 0.2, pad ? y + h + P.bottom / 2 : y + h - font * 0.3);
   }
   if (statsText) {
-    ctx.textBaseline = 'top';
     const lines2 = Array.isArray(statsText) ? statsText : [statsText];
-    const tw = Math.max(...lines2.map((t) => ctx.measureText(t).width));
-    ctx.shadowBlur = 0;
-    ctx.fillStyle = 'rgba(0,0,0,0.6)';
-    ctx.fillRect(x + w - tw - font, y, tw + font, font * (0.8 + lines2.length * 1.25));
-    ctx.fillStyle = 'rgba(235,235,235,0.9)';
-    lines2.forEach((t, i) => ctx.fillText(t, x + w - font * 0.5, y + font * 0.4 + i * font * 1.25));
+    ctx.textBaseline = 'top';
+    if (pad) {
+      ctx.fillStyle = 'rgba(235,235,235,0.92)';
+      const top = y - P.top + (P.top - lines2.length * font * 1.2) / 2;
+      lines2.forEach((t, i) => ctx.fillText(t, x + w - font * 0.2, top + i * font * 1.2));
+    } else {
+      const tw = Math.max(...lines2.map((t) => ctx.measureText(t).width));
+      ctx.fillStyle = 'rgba(0,0,0,0.6)';
+      ctx.fillRect(x + w - tw - font, y, tw + font, font * (0.8 + lines2.length * 1.25));
+      ctx.fillStyle = 'rgba(235,235,235,0.9)';
+      lines2.forEach((t, i) => ctx.fillText(t, x + w - font * 0.5, y + font * 0.4 + i * font * 1.25));
+    }
   }
   ctx.restore();
 }

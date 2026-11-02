@@ -93,3 +93,17 @@ test('uses a known raster and finds nothing in an empty room', () => {
   const blank = new Uint8ClampedArray(W * H * 4).fill(5);
   assert.equal(detectPicture(blank, W, H), null);
 });
+
+test('frame grab with letterbox bars: picture between the bars', () => {
+  const d = new Uint8ClampedArray(W * H * 4);
+  const top = Math.round(H * 0.125), bot = H - top;
+  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+    const o = (y * W + x) * 4;
+    const v = y < top || y >= bot ? 0 : 60 + Math.round(150 * (x / W));
+    d[o] = d[o + 1] = d[o + 2] = v; d[o + 3] = 255;
+  }
+  const r = detectPicture(d, W, H);
+  assert.ok(r && r.ok && r.frame);
+  assert.ok(Math.abs(r.quad[0][1] * H - top) < 3 && Math.abs(r.quad[2][1] * H - bot) < 3);
+  assert.ok(r.quad[0][0] < 0.01 && r.quad[1][0] > 0.99);
+});
